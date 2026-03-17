@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QFileDialog,
     QGridLayout,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
 )
 
+from sdtool.backend import BackendInterface
 from sdtool.models import mock_source_devices, mock_target_devices
 from sdtool.workflow import StepStatus, WorkflowController
 
@@ -215,6 +216,18 @@ class MainWindow(QMainWindow):
             return
 
         step_definitions = OPERATION_STEPS[operation_name]
+        for name, backend in step_definitions:
+            if backend == "windows_disk":
+                response = self.controller.connect_to_windows_disk(name)
+                if not response.success:
+                    self.fail_operation()
+                    return
+            elif backend == "wsl_shrink":
+                response = self.controller.shrink_wsl_image(name)
+                if not response.success:
+                    self.fail_operation()
+                    return
+
         self.controller.start_operation(operation_name, step_definitions)
         self.active_operation = operation_name
         self.progress_value = 1
@@ -269,7 +282,7 @@ class MainWindow(QMainWindow):
         icons = {
             StepStatus.PENDING: "○",
             StepStatus.RUNNING: "▶",
-            StepStatus.COMPLETE: "✓",
+            StepStatus.COMPLETED: "✓",
             StepStatus.FAILED: "✗",
         }
 

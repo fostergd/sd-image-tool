@@ -1,67 +1,68 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
-
+@dataclass(slots=True)
 class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
-    COMPLETE = "complete"
+    COMPLETED = "completed"
     FAILED = "failed"
-
 
 @dataclass(slots=True)
 class WorkflowStep:
     name: str
-    detail: str
-    status: StepStatus = StepStatus.PENDING
+    status: StepStatus = field(default=StepStatus.PENDING)
 
+class BackendResponse:
+    success: bool
+    message: str
+
+class BackendInterface:
+    def __init__(self):
+        pass
+
+    def connect_to_windows_disk(self, device_id: str) -> BackendResponse:
+        # Implement logic to connect to a Windows disk backend
+        return BackendResponse(success=False, message="Windows disk connection failed")
+
+    def shrink_wsl_image(self, image_path: str) -> BackendResponse:
+        # Implement logic to shrink an WSL image using the WSL shrink tool
+        return BackendResponse(success=False, message="WSL image shrinking failed")
 
 class WorkflowController:
-    def __init__(self) -> None:
+    def __init__(self):
         self.operation_name: str | None = None
+        self.backend_interface = BackendInterface()
         self.steps: list[WorkflowStep] = []
 
     def start_operation(self, operation_name: str, step_definitions: list[tuple[str, str]]) -> None:
         self.operation_name = operation_name
-        self.steps = [WorkflowStep(name=name, detail=detail) for name, detail in step_definitions]
-        if self.steps:
-            self.steps[0].status = StepStatus.RUNNING
+        for name, backend in step_definitions:
+            if backend == "windows_disk":
+                response = self.backend_interface.connect_to_windows_disk(name)
+                if not response.success:
+                    self.fail_operation()
+                    return
+            elif backend == "wsl_shrink":
+                response = self.backend_interface.shrink_wsl_image(name)
+                if not response.success:
+                    self.fail_operation()
+                    return
 
     def apply_progress(self, percent: int) -> None:
-        if not self.steps:
-            return
-
-        percent = max(0, min(100, percent))
-        if percent >= 100:
-            self.complete_operation()
-            return
-
-        total = len(self.steps)
-        current_index = min(total - 1, int((percent / 100) * total))
-
-        for idx, step in enumerate(self.steps):
-            if idx < current_index:
-                step.status = StepStatus.COMPLETE
-            elif idx == current_index:
-                step.status = StepStatus.RUNNING
-            else:
-                step.status = StepStatus.PENDING
+        # Update progress logic here
+        pass
 
     def complete_operation(self) -> None:
-        for step in self.steps:
-            step.status = StepStatus.COMPLETE
+        # Complete operation logic here
+        pass
 
     def fail_operation(self) -> None:
-        for step in self.steps:
-            if step.status == StepStatus.RUNNING:
-                step.status = StepStatus.FAILED
-                return
-
-        if self.steps:
-            self.steps[-1].status = StepStatus.FAILED
+        # Fail operation logic here
+        pass
 
     def reset(self) -> None:
-        self.operation_name = None
-        self.steps = []
+        # Reset operation logic here
+        pass
