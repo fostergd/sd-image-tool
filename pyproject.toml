@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sd-image-tool"
+version = "0.1.0"
+description = "Windows-first SD image read/write/shrink utility with a safe mock-mode UI."
+readme = ""
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+sd-image-tool = "sdtool.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
