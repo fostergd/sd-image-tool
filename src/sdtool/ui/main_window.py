@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QGridLayout,
     QGroupBox,
@@ -14,51 +15,24 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
-    QComboBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
-    QProgressBar,
 )
 
-from sdtool.backend import BackendInterface
-from sdtool.models import mock_source_devices, mock_target_devices
+from sdtool.backend import BackendInterface, MockBackend, OperationContext
 from sdtool.workflow import StepStatus, WorkflowController
-
-OPERATION_STEPS: dict[str, list[tuple[str, str]]] = {
-    "save": [
-        ("Check source device", "Confirm selected SD card is removable and readable."),
-        ("Read card to image", "Copy raw device contents to an image file."),
-        ("Validate image", "Confirm image size and basic integrity checks."),
-        ("Finish", "Present summary and next available action."),
-    ],
-    "shrink": [
-        ("Validate image", "Confirm the selected image exists and is readable."),
-        ("Send to WSL", "Hand off the image to the Linux shrink backend."),
-        ("Run PiShrink", "Shrink the filesystem and image size."),
-        ("Verify output", "Check that the shrunken image was produced."),
-    ],
-    "write": [
-        ("Check target device", "Confirm selected target is removable and large enough."),
-        ("Write image", "Copy the image file to the selected target device."),
-        ("Verify write", "Perform a post-write verification pass."),
-        ("Finish", "Present summary and next available action."),
-    ],
-    "verify": [
-        ("Read sample blocks", "Collect source and target sample data."),
-        ("Compare", "Compare samples or checksums."),
-        ("Finish", "Present verification result."),
-    ],
-}
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, backend: BackendInterface | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("SD Image Tool - Mock Mode")
+        self.setWindowTitle("SD Image Tool - Mock Backend")
         self.resize(1100, 760)
 
+        self.backend = backend or MockBackend()
         self.controller = WorkflowController()
         self.active_operation: str | None = None
         self.progress_value = 0
@@ -67,13 +41,10 @@ class MainWindow(QMainWindow):
         self.timer.setInterval(120)
         self.timer.timeout.connect(self._advance_mock_operation)
 
-        self.source_devices = mock_source_devices()
-        self.target_devices = mock_target_devices()
-
         self._build_ui()
         self._load_devices()
-        self._log("Mock mode is enabled. No real disks are touched in this build.")
-        self._set_status("Ready. Safe mock mode active.")
+        self._log("Mock backend is enabled. No real disks are touched in this build.")
+        self._set_status("Ready. Safe mock backend active.")
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -83,7 +54,7 @@ class MainWindow(QMainWindow):
         root.setSpacing(12)
 
         top_notice = QLabel(
-            "This first build is intentionally non-destructive. "
+            "This build is intentionally non-destructive. "
             "It lets us iterate on workflow, status reporting, and long-running operations safely."
         )
         top_notice.setWordWrap(True)
@@ -192,18 +163,18 @@ class MainWindow(QMainWindow):
             self._log(f"Selected image path: {filename}")
 
     def _load_devices(self) -> None:
-        self.source_devices = mock_source_devices()
-        self.target_devices = mock_target_devices()
+        source_devices = self.backend.list_source_devices()
+        target_devices = self.backend.list_target_devices()
 
         self.source_combo.clear()
-        for device in self.source_devices:
+        for device in source_devices:
             self.source_combo.addItem(device.label(), device.device_id)
 
         self.target_combo.clear()
-        for device in self.target_devices:
+        for device in target_devices:
             self.target_combo.addItem(device.label(), device.device_id)
 
-        self._log("Refreshed mock device list.")
+        self._log("Refreshed device list from backend.")
         self._set_status("Device list refreshed.")
 
     def _start_mock_operation(self, operation_name: str) -> None:
@@ -215,18 +186,25 @@ class MainWindow(QMainWindow):
             )
             return
 
-        step_definitions = OPERATION_STEPS[operation_name]
-        for name, backend in step_definitions:
-            if backend == "windows_disk":
-                response = self.controller.connect_to_windows_disk(name)
-                if not response.success:
-                    self.fail_operation()
-                    return
-            elif backend == "wsl_shrink":
-                response = self.controller.shrink_wsl_image(name)
-                if not response.success:
-                    self.fail_operation()
-                    return
+        context = OperationContext(
+            operation_name=operation_name,
+            source_device_id=self.source_combo.currentData(),
+            target_device_id=self.target_combo.currentData(),
+            image_path=self.image_path_edit.text().strip(),
+        )
+
+        warnings = self.backend.validate_operation(context)
+        if warnings:
+            QMessageBox.warning(self, "Cannot start operation", "\n".join(warnings))
+            self._log(f"Operation '{operation_name}' was blocked by validation.")
+            return
+
+        try:
+            step_definitions = self.backend.get_operation_steps(operation_name)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Unknown operation", str(exc))
+            self._log(str(exc))
+            return
 
         self.controller.start_operation(operation_name, step_definitions)
         self.active_operation = operation_name
@@ -234,12 +212,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self._refresh_queue()
 
-        image_path = self.image_path_edit.text().strip()
         self._log(
             f"Started mock '{operation_name}' operation. "
-            f"Source={self.source_combo.currentData()} "
-            f"Target={self.target_combo.currentData()} "
-            f"Image={image_path}"
+            f"Source={context.source_device_id} "
+            f"Target={context.target_device_id} "
+            f"Image={context.image_path}"
         )
         self._set_status(f"Running '{operation_name}' operation...")
         self.timer.start()
@@ -253,7 +230,7 @@ class MainWindow(QMainWindow):
             completed_name = self.active_operation or "operation"
             self._refresh_queue()
             self.progress_bar.setValue(100)
-            self._set_status(f"Completed '{completed_name}' in mock mode.")
+            self._set_status(f"Completed '{completed_name}' in mock backend.")
             self._log(f"Completed mock '{completed_name}' operation.")
             self.active_operation = None
             return
@@ -282,7 +259,7 @@ class MainWindow(QMainWindow):
         icons = {
             StepStatus.PENDING: "○",
             StepStatus.RUNNING: "▶",
-            StepStatus.COMPLETED: "✓",
+            StepStatus.COMPLETE: "✓",
             StepStatus.FAILED: "✗",
         }
 
