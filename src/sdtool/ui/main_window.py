@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from sdtool.backend import BackendInterface, MockBackend, OperationContext
+from sdtool.formatting import describe_reduction, format_bytes
 from sdtool.workflow import StepStatus, WorkflowController
 from sdtool.wsl_shrink import (
     WslCommandPlan,
@@ -38,7 +39,7 @@ class MainWindow(QMainWindow):
     def __init__(self, backend: BackendInterface | None = None) -> None:
         super().__init__()
         self.setWindowTitle("SD Image Tool - Mock Backend")
-        self.resize(1200, 760)
+        self.resize(1200, 820)
 
         self.backend = backend or MockBackend()
         self.controller = WorkflowController()
@@ -58,7 +59,9 @@ class MainWindow(QMainWindow):
 
         self.active_shrink_process: subprocess.Popen[str] | None = None
         self.active_shrink_plan: WslCommandPlan | None = None
+        self.active_shrink_source_size: int | None = None
         self.shrink_progress_value = 0
+        self.shrink_final_stage_logged = False
 
         self._build_ui()
         self._load_devices()
@@ -96,6 +99,7 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.progress_bar)
 
         root.addWidget(progress_group)
+        root.addWidget(self._build_last_result_group())
 
         bottom_layout = QHBoxLayout()
         bottom_layout.addWidget(self._build_queue_group(), 1)
@@ -168,7 +172,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
 
         help_label = QLabel(
-            "Completed and cancelled operations appear here with the device selections and image path used."
+            "Completed, failed, and cancelled operations appear here with the device selections and image path used."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
@@ -185,6 +189,48 @@ class MainWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         layout.addWidget(self.log_view)
         return group
+
+    def _build_last_result_group(self) -> QGroupBox:
+        group = QGroupBox("Last Shrink Result")
+        layout = QGridLayout(group)
+
+        layout.addWidget(QLabel("Status"), 0, 0)
+        self.result_status_value = QLabel("No shrink completed yet.")
+        layout.addWidget(self.result_status_value, 0, 1)
+
+        layout.addWidget(QLabel("Original Size"), 1, 0)
+        self.result_input_size_value = QLabel("-")
+        layout.addWidget(self.result_input_size_value, 1, 1)
+
+        layout.addWidget(QLabel("Shrunk Size"), 2, 0)
+        self.result_output_size_value = QLabel("-")
+        layout.addWidget(self.result_output_size_value, 2, 1)
+
+        layout.addWidget(QLabel("Space Saved"), 3, 0)
+        self.result_saved_value = QLabel("-")
+        layout.addWidget(self.result_saved_value, 3, 1)
+
+        layout.addWidget(QLabel("Output Path"), 4, 0)
+        self.result_output_path_value = QLabel("-")
+        self.result_output_path_value.setWordWrap(True)
+        layout.addWidget(self.result_output_path_value, 4, 1)
+
+        return group
+
+    def _set_last_result(
+        self,
+        *,
+        status: str,
+        original_size: str = "-",
+        output_size: str = "-",
+        saved: str = "-",
+        output_path: str = "-",
+    ) -> None:
+        self.result_status_value.setText(status)
+        self.result_input_size_value.setText(original_size)
+        self.result_output_size_value.setText(output_size)
+        self.result_saved_value.setText(saved)
+        self.result_output_path_value.setText(output_path)
 
     def _browse_image_path(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
@@ -304,6 +350,7 @@ class MainWindow(QMainWindow):
         try:
             plan = build_pishrink_plan(context.image_path)
             step_definitions = self.backend.get_operation_steps("shrink")
+            source_size = image_path.stat().st_size
         except ValueError as exc:
             QMessageBox.critical(self, "Cannot prepare shrink", str(exc))
             self._log(f"Shrink preparation failed: {exc}")
@@ -316,11 +363,19 @@ class MainWindow(QMainWindow):
         self.active_source_label = self.source_combo.currentText()
         self.active_target_label = self.target_combo.currentText()
         self.active_shrink_plan = plan
+        self.active_shrink_source_size = source_size
         self.shrink_progress_value = 15
+        self.shrink_final_stage_logged = False
         self.progress_bar.setValue(self.shrink_progress_value)
         self._refresh_queue()
+        self._set_last_result(
+            status="Shrink running...",
+            original_size=format_bytes(source_size),
+            output_path=plan.output_path_windows,
+        )
 
         self._log(f"Prepared WSL shrink plan for: {plan.image_path_windows}")
+        self._log(f"Original image size: {format_bytes(source_size)}")
         self._log(f"Shrink output will be: {plan.output_path_windows}")
         self._log(f"WSL command: {plan.shell_command}")
         self._set_status("Starting WSL shrink. This may take a while for large images...")
@@ -363,10 +418,17 @@ class MainWindow(QMainWindow):
             self.controller.set_running_step(2)
             self.progress_bar.setValue(self.shrink_progress_value)
             self._refresh_queue()
-            self._set_status(
-                f"Shrinking image in WSL... {self.shrink_progress_value}% "
-                f"(large images can take quite a while)"
-            )
+
+            if self.shrink_progress_value >= 90:
+                self._set_status("Finishing shrink and truncating image... this can sit near 90% for a while.")
+                if not self.shrink_final_stage_logged:
+                    self._log("Shrink has reached the final stage. It may sit near 90% while PiShrink finishes filesystem work and truncates the image.")
+                    self.shrink_final_stage_logged = True
+            else:
+                self._set_status(
+                    f"Shrinking image in WSL... {self.shrink_progress_value}% "
+                    f"(large images can take quite a while)"
+                )
             return
 
         self.shrink_poll_timer.stop()
@@ -381,10 +443,38 @@ class MainWindow(QMainWindow):
             self.controller.complete_operation()
             self.progress_bar.setValue(100)
             self._refresh_queue()
-            self._set_status("Shrink completed successfully.")
+
+            output_size_text = "-"
+            saved_text = "-"
+            status_text = "Shrink completed successfully."
+            output_path_text = plan.output_path_windows if plan is not None else "-"
+
+            if plan is not None:
+                output_path = Path(plan.output_path_windows)
+                if output_path.exists() and output_path.is_file():
+                    output_size = output_path.stat().st_size
+                    output_size_text = format_bytes(output_size)
+
+                    if self.active_shrink_source_size is not None:
+                        saved_text = describe_reduction(self.active_shrink_source_size, output_size)
+                        status_text = f"Shrink completed successfully. {saved_text}"
+
+                    self._log(f"Shrunk image size: {output_size_text}")
+
+            self._set_last_result(
+                status=status_text,
+                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
+                output_size=output_size_text,
+                saved=saved_text,
+                output_path=output_path_text,
+            )
+
+            self._set_status(status_text)
             self._log(f"Completed real WSL shrink operation: {completed_name}")
             if plan is not None:
                 self._log(f"Shrink output image: {plan.output_path_windows}")
+            if saved_text != "-":
+                self._log(saved_text)
             if stdout.strip():
                 self._log("PiShrink output:")
                 self._log(stdout.strip())
@@ -393,6 +483,11 @@ class MainWindow(QMainWindow):
             self.controller.fail_operation()
             self._refresh_queue()
             self._set_status("Shrink failed.")
+            self._set_last_result(
+                status="Shrink failed.",
+                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
+                output_path=plan.output_path_windows if plan is not None else "-",
+            )
             self._log(f"WSL shrink failed with return code {returncode}.")
             if stderr.strip():
                 self._log("PiShrink error output:")
@@ -437,6 +532,11 @@ class MainWindow(QMainWindow):
             self.controller.fail_operation()
             self._refresh_queue()
             self._set_status(f"Cancelled '{failed_name}'.")
+            self._set_last_result(
+                status="Shrink cancelled." if failed_name == "shrink" else f"{failed_name} cancelled.",
+                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
+                output_path=self.active_shrink_plan.output_path_windows if self.active_shrink_plan is not None else "-",
+            )
             self._log(f"Cancelled real WSL shrink operation: {failed_name}")
             if stdout.strip():
                 self._log("Process output before cancellation:")
@@ -492,8 +592,10 @@ class MainWindow(QMainWindow):
         self.active_target_label = ""
         self.active_shrink_process = None
         self.active_shrink_plan = None
+        self.active_shrink_source_size = None
         self.progress_value = 0
         self.shrink_progress_value = 0
+        self.shrink_final_stage_logged = False
 
     def _refresh_queue(self) -> None:
         icons = {
