@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
@@ -30,11 +31,14 @@ class MainWindow(QMainWindow):
     def __init__(self, backend: BackendInterface | None = None) -> None:
         super().__init__()
         self.setWindowTitle("SD Image Tool - Mock Backend")
-        self.resize(1100, 760)
+        self.resize(1200, 760)
 
         self.backend = backend or MockBackend()
         self.controller = WorkflowController()
         self.active_operation: str | None = None
+        self.active_context: OperationContext | None = None
+        self.active_source_label = ""
+        self.active_target_label = ""
         self.progress_value = 0
 
         self.timer = QTimer(self)
@@ -80,6 +84,7 @@ class MainWindow(QMainWindow):
 
         bottom_layout = QHBoxLayout()
         bottom_layout.addWidget(self._build_queue_group(), 1)
+        bottom_layout.addWidget(self._build_recent_jobs_group(), 1)
         bottom_layout.addWidget(self._build_log_group(), 2)
         root.addLayout(bottom_layout, 1)
 
@@ -141,6 +146,21 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
         self.queue_list = QListWidget()
         layout.addWidget(self.queue_list)
+        return group
+
+    def _build_recent_jobs_group(self) -> QGroupBox:
+        group = QGroupBox("Recent Jobs")
+        layout = QVBoxLayout(group)
+
+        help_label = QLabel(
+            "Completed and cancelled operations appear here with the device selections and image path used."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        self.recent_jobs_list = QListWidget()
+        layout.addWidget(self.recent_jobs_list)
+
         return group
 
     def _build_log_group(self) -> QGroupBox:
@@ -208,6 +228,9 @@ class MainWindow(QMainWindow):
 
         self.controller.start_operation(operation_name, step_definitions)
         self.active_operation = operation_name
+        self.active_context = context
+        self.active_source_label = self.source_combo.currentText()
+        self.active_target_label = self.target_combo.currentText()
         self.progress_value = 1
         self.progress_bar.setValue(0)
         self._refresh_queue()
@@ -232,7 +255,11 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(100)
             self._set_status(f"Completed '{completed_name}' in mock backend.")
             self._log(f"Completed mock '{completed_name}' operation.")
+            self._record_recent_job("Completed", completed_name)
             self.active_operation = None
+            self.active_context = None
+            self.active_source_label = ""
+            self.active_target_label = ""
             return
 
         self.controller.apply_progress(self.progress_value)
@@ -254,6 +281,43 @@ class MainWindow(QMainWindow):
         self._set_status(f"Cancelled '{failed_name}'.")
         self._log(f"Cancelled mock '{failed_name}' operation.")
         self.progress_bar.setValue(0)
+        self._record_recent_job("Cancelled", failed_name)
+        self.active_context = None
+        self.active_source_label = ""
+        self.active_target_label = ""
+
+    def _record_recent_job(self, status: str, operation_name: str) -> None:
+        if self.active_context is None:
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        image_path = self.active_context.image_path or "(none)"
+        display_text = (
+            f"{timestamp} | {status} | {operation_name} | "
+            f"Source: {self.active_source_label or '(none)'} | "
+            f"Target: {self.active_target_label or '(none)'}"
+        )
+
+        item = QListWidgetItem(display_text)
+        item.setToolTip(
+            f"Time: {timestamp}\n"
+            f"Status: {status}\n"
+            f"Operation: {operation_name}\n"
+            f"Source: {self.active_source_label or '(none)'}\n"
+            f"Target: {self.active_target_label or '(none)'}\n"
+            f"Image: {image_path}"
+        )
+        self.recent_jobs_list.insertItem(0, item)
+
+        while self.recent_jobs_list.count() > 50:
+            self.recent_jobs_list.takeItem(self.recent_jobs_list.count() - 1)
+
+        self._log(
+            f"Recent job recorded: {status} {operation_name} | "
+            f"Source={self.active_source_label or '(none)'} | "
+            f"Target={self.active_target_label or '(none)'} | "
+            f"Image={image_path}"
+        )
 
     def _refresh_queue(self) -> None:
         icons = {
