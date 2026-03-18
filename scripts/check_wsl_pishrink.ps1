@@ -19,12 +19,15 @@ ok = check_wsl_pishrink_available(cfg)
 
 print("Distro:", cfg.distro)
 print("PiShrink command:", cfg.pishrink_command)
+print("WSL user:", cfg.wsl_user or "(default)")
 print("WSL PiShrink available:", "YES" if ok else "NO")
 
 if len(sys.argv) > 1 and sys.argv[1]:
     plan = build_pishrink_plan(sys.argv[1], cfg)
     print("Input image: ", plan.image_path_windows)
     print("Output image:", plan.output_path_windows)
+    print("WSL argv:")
+    print(plan.argv)
     print("WSL shell command:")
     print(plan.shell_command)
 

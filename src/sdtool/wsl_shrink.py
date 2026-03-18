@@ -10,7 +10,7 @@ import subprocess
 class WslPiShrinkConfig:
     distro: str = "Ubuntu"
     pishrink_command: str = "pishrink.sh"
-    use_sudo: bool = False
+    wsl_user: str | None = "root"
     keep_original: bool = True
 
 
@@ -70,6 +70,16 @@ def derive_shrunk_image_path(path: str) -> str:
     return str(win_path.with_name(new_name))
 
 
+def _build_wsl_argv(distro: str, shell_command: str, wsl_user: str | None) -> tuple[str, ...]:
+    argv: list[str] = ["wsl.exe", "-d", distro]
+
+    if wsl_user:
+        argv.extend(["-u", wsl_user])
+
+    argv.extend(["bash", "-lc", shell_command])
+    return tuple(argv)
+
+
 def build_pishrink_plan(
     image_path: str,
     config: WslPiShrinkConfig | None = None,
@@ -91,11 +101,10 @@ def build_pishrink_plan(
     if cfg.keep_original:
         shell_steps.append(f"cp {shlex.quote(source_wsl)} {shlex.quote(output_wsl)}")
 
-    command_prefix = f"sudo {cfg.pishrink_command}" if cfg.use_sudo else cfg.pishrink_command
-    shell_steps.append(f"{command_prefix} {shlex.quote(output_wsl)}")
+    shell_steps.append(f"{cfg.pishrink_command} {shlex.quote(output_wsl)}")
 
     shell_command = " && ".join(shell_steps)
-    argv = ("wsl.exe", "-d", cfg.distro, "bash", "-lc", shell_command)
+    argv = _build_wsl_argv(cfg.distro, shell_command, cfg.wsl_user)
 
     return WslCommandPlan(
         distro=cfg.distro,
@@ -111,7 +120,7 @@ def build_pishrink_plan(
 def check_wsl_pishrink_available(config: WslPiShrinkConfig | None = None) -> bool:
     cfg = config or WslPiShrinkConfig()
     probe_command = f"command -v {shlex.quote(cfg.pishrink_command)} >/dev/null 2>&1"
-    argv = ["wsl.exe", "-d", cfg.distro, "bash", "-lc", probe_command]
+    argv = list(_build_wsl_argv(cfg.distro, probe_command, cfg.wsl_user))
 
     completed = subprocess.run(
         argv,
@@ -120,6 +129,15 @@ def check_wsl_pishrink_available(config: WslPiShrinkConfig | None = None) -> boo
         check=False,
     )
     return completed.returncode == 0
+
+
+def start_pishrink_process(plan: WslCommandPlan) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        list(plan.argv),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def run_pishrink_plan(

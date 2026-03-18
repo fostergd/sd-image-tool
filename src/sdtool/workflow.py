@@ -29,6 +29,20 @@ class WorkflowController:
         if self.steps:
             self.steps[0].status = StepStatus.RUNNING
 
+    def set_running_step(self, step_index: int) -> None:
+        if not self.steps:
+            return
+
+        step_index = max(0, min(step_index, len(self.steps) - 1))
+
+        for idx, step in enumerate(self.steps):
+            if idx < step_index:
+                step.status = StepStatus.COMPLETE
+            elif idx == step_index:
+                step.status = StepStatus.RUNNING
+            else:
+                step.status = StepStatus.PENDING
+
     def apply_progress(self, percent: int) -> None:
         if not self.steps:
             return

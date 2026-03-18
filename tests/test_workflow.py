@@ -19,6 +19,26 @@ def test_start_operation_marks_first_step_running() -> None:
     assert controller.steps[2].status == StepStatus.PENDING
 
 
+def test_set_running_step_marks_prior_steps_complete() -> None:
+    controller = WorkflowController()
+    controller.start_operation(
+        "shrink",
+        [
+            ("step1", "detail1"),
+            ("step2", "detail2"),
+            ("step3", "detail3"),
+            ("step4", "detail4"),
+        ],
+    )
+
+    controller.set_running_step(2)
+
+    assert controller.steps[0].status == StepStatus.COMPLETE
+    assert controller.steps[1].status == StepStatus.COMPLETE
+    assert controller.steps[2].status == StepStatus.RUNNING
+    assert controller.steps[3].status == StepStatus.PENDING
+
+
 def test_apply_progress_completes_earlier_steps() -> None:
     controller = WorkflowController()
     controller.start_operation(
