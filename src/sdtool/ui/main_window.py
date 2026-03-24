@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import subprocess
+from shutil import copystat, disk_usage
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -26,6 +29,13 @@ from PySide6.QtWidgets import (
 
 from sdtool.backend import BackendInterface, MockBackend, OperationContext
 from sdtool.formatting import describe_reduction, format_bytes
+from sdtool.image_vault import (
+    VaultImage,
+    default_vault_path,
+    next_available_image_path,
+    record_import_metadata,
+    scan_vault,
+)
 from sdtool.workflow import StepStatus, WorkflowController
 from sdtool.wsl_shrink import (
     WslCommandPlan,
@@ -39,7 +49,7 @@ class MainWindow(QMainWindow):
     def __init__(self, backend: BackendInterface | None = None) -> None:
         super().__init__()
         self.setWindowTitle("SD Image Tool - Mock Backend")
-        self.resize(1200, 820)
+        self.resize(1180, 700)
 
         self.backend = backend or MockBackend()
         self.controller = WorkflowController()
@@ -62,10 +72,16 @@ class MainWindow(QMainWindow):
         self.active_shrink_source_size: int | None = None
         self.shrink_progress_value = 0
         self.shrink_final_stage_logged = False
+        self.delete_source_after_successful_shrink: Path | None = None
+
+        self.vault_path = default_vault_path()
+        self.vault_images: list[VaultImage] = []
 
         self._build_ui()
         self._load_devices()
+        self._refresh_vault()
         self._log("Mock backend is enabled for save/write/verify. Shrink can run in real WSL mode.")
+        self._log(f"Image vault folder: {self.vault_path}")
         self._set_status("Ready. Safe mock backend active.")
 
     def _build_ui(self) -> None:
@@ -73,7 +89,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setSpacing(12)
+        root.setSpacing(10)
 
         top_notice = QLabel(
             "This build is intentionally non-destructive for disk access. "
@@ -82,15 +98,25 @@ class MainWindow(QMainWindow):
         top_notice.setWordWrap(True)
         root.addWidget(top_notice)
 
-        controls_layout = QHBoxLayout()
-        controls_layout.addWidget(self._build_sources_group(), 1)
-        controls_layout.addWidget(self._build_actions_group(), 1)
-        root.addLayout(controls_layout)
+        main_row = QHBoxLayout()
+
+        main_row.addWidget(self._build_vault_group(), 1)
+
+        right_column = QVBoxLayout()
+
+        upper_right = QHBoxLayout()
+        upper_right.addWidget(self._build_sources_group(), 3)
+        upper_right.addWidget(self._build_actions_group(), 2)
+        right_column.addLayout(upper_right)
+
+        status_row = QHBoxLayout()
+
+        status_left_column = QVBoxLayout()
 
         progress_group = QGroupBox("Current Status")
         progress_layout = QVBoxLayout(progress_group)
-
         self.status_label = QLabel("Ready.")
+        self.status_label.setWordWrap(True)
         progress_layout.addWidget(self.status_label)
 
         self.progress_bar = QProgressBar()
@@ -98,8 +124,16 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         progress_layout.addWidget(self.progress_bar)
 
-        root.addWidget(progress_group)
-        root.addWidget(self._build_last_result_group())
+        status_left_column.addWidget(progress_group)
+        status_left_column.addWidget(self._build_drive_group())
+
+        status_row.addLayout(status_left_column, 2)
+        status_row.addWidget(self._build_last_result_group(), 1)
+        right_column.addLayout(status_row)
+
+        main_row.addLayout(right_column, 3)
+
+        root.addLayout(main_row, 2)
 
         bottom_layout = QHBoxLayout()
         bottom_layout.addWidget(self._build_queue_group(), 1)
@@ -120,7 +154,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.target_combo, 1, 1)
 
         layout.addWidget(QLabel("Image File"), 2, 0)
-        self.image_path_edit = QLineEdit(str(Path.home() / "sd-images" / "raspi-image.img"))
+        self.image_path_edit = QLineEdit("")
+        self.image_path_edit.setPlaceholderText("Select or browse to an image file (.img)")
         layout.addWidget(self.image_path_edit, 2, 1)
 
         browse_btn = QPushButton("Browse...")
@@ -133,9 +168,53 @@ class MainWindow(QMainWindow):
 
         return group
 
+    def _build_vault_group(self) -> QGroupBox:
+        group = QGroupBox("Vault Images")
+        layout = QVBoxLayout(group)
+
+        path_label = QLabel(f"Stored with the app in:\n{self.vault_path}")
+        path_label.setWordWrap(True)
+        layout.addWidget(path_label)
+
+        toolbar = QHBoxLayout()
+
+        import_btn = QPushButton("Import Image")
+        import_btn.clicked.connect(self._import_image_into_vault)
+        toolbar.addWidget(import_btn)
+
+        self.delete_vault_btn = QPushButton("Delete Selected")
+        self.delete_vault_btn.clicked.connect(self._delete_selected_vault_image)
+        self.delete_vault_btn.setEnabled(False)
+        toolbar.addWidget(self.delete_vault_btn)
+
+        refresh_btn = QPushButton("Refresh Vault")
+        refresh_btn.clicked.connect(self._refresh_vault)
+        toolbar.addWidget(refresh_btn)
+
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+
+        self.vault_list = QListWidget()
+        self.vault_list.itemSelectionChanged.connect(self._on_vault_selection_changed)
+        self.vault_list.setMinimumWidth(285)
+        self.vault_list.setMinimumHeight(0)
+        self.vault_list.setWordWrap(True)
+        self.vault_list.setSpacing(4)
+        layout.addWidget(self.vault_list, 1)
+
+        self.vault_summary_label = QLabel("No images found in vault.")
+        self.vault_summary_label.setWordWrap(True)
+        layout.addWidget(self.vault_summary_label, 0)
+
+        return group
+
     def _build_actions_group(self) -> QGroupBox:
         group = QGroupBox("Actions")
         layout = QVBoxLayout(group)
+
+        self.write_btn = QPushButton("Write Image to SD Card")
+        self.write_btn.clicked.connect(lambda: self._start_operation("write"))
+        layout.addWidget(self.write_btn)
 
         self.save_btn = QPushButton("Save SD Card to Image")
         self.save_btn.clicked.connect(lambda: self._start_operation("save"))
@@ -144,10 +223,6 @@ class MainWindow(QMainWindow):
         self.shrink_btn = QPushButton("Shrink Existing Image")
         self.shrink_btn.clicked.connect(lambda: self._start_operation("shrink"))
         layout.addWidget(self.shrink_btn)
-
-        self.write_btn = QPushButton("Write Image to SD Card")
-        self.write_btn.clicked.connect(lambda: self._start_operation("write"))
-        layout.addWidget(self.write_btn)
 
         self.verify_btn = QPushButton("Verify Last Write")
         self.verify_btn.clicked.connect(lambda: self._start_operation("verify"))
@@ -158,6 +233,24 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.cancel_btn)
 
         layout.addStretch(1)
+        return group
+
+    def _build_drive_group(self) -> QGroupBox:
+        group = QGroupBox("Tool Drive Status")
+        layout = QVBoxLayout(group)
+
+        self.drive_size_value = QLabel("Drive Size: -")
+        self.drive_size_value.setWordWrap(True)
+        layout.addWidget(self.drive_size_value)
+
+        self.drive_free_value = QLabel("Drive Free Space: -")
+        self.drive_free_value.setWordWrap(True)
+        layout.addWidget(self.drive_free_value)
+
+        self.vault_size_value = QLabel("Vault Size: -")
+        self.vault_size_value.setWordWrap(True)
+        layout.addWidget(self.vault_size_value)
+
         return group
 
     def _build_queue_group(self) -> QGroupBox:
@@ -196,6 +289,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(QLabel("Status"), 0, 0)
         self.result_status_value = QLabel("No shrink completed yet.")
+        self.result_status_value.setWordWrap(True)
         layout.addWidget(self.result_status_value, 0, 1)
 
         layout.addWidget(QLabel("Original Size"), 1, 0)
@@ -236,7 +330,7 @@ class MainWindow(QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(
             self,
             "Choose image file",
-            self.image_path_edit.text(),
+            self.image_path_edit.text() or str(self.vault_path),
             "Image Files (*.img);;All Files (*.*)",
         )
         if filename:
@@ -257,6 +351,241 @@ class MainWindow(QMainWindow):
 
         self._log("Refreshed device list from backend.")
         self._set_status("Device list refreshed.")
+
+    def _refresh_drive_status(self) -> None:
+        try:
+            usage_target = self.vault_path if self.vault_path.exists() else self.vault_path.parent
+            usage = disk_usage(usage_target)
+            vault_size = sum(image.size_bytes for image in self.vault_images)
+
+            self.drive_size_value.setText(f"Drive Size: {format_bytes(usage.total)}")
+            self.drive_free_value.setText(f"Drive Free Space: {format_bytes(usage.free)}")
+            self.vault_size_value.setText(f"Vault Size: {format_bytes(vault_size)}")
+        except OSError as exc:
+            self.drive_size_value.setText("Drive Size: Unavailable")
+            self.drive_free_value.setText("Drive Free Space: Unavailable")
+            self.vault_size_value.setText("Vault Size: Unavailable")
+            self._log(f"Could not read tool drive status: {exc}")
+
+    def _refresh_vault(self, *, select_path: Path | None = None) -> None:
+        self.vault_images = scan_vault(self.vault_path)
+        self.vault_list.clear()
+        self.delete_vault_btn.setEnabled(False)
+
+        for image in self.vault_images:
+            line1 = image.filename
+            line2 = f"{image.formatted_size} | {image.formatted_modified} | {image.status_text}"
+            text = f"{line1}\n{line2}"
+
+            item = QListWidgetItem(text)
+            item.setData(256, str(image.path))
+            item.setSizeHint(QSize(item.sizeHint().width(), item.sizeHint().height() + 12))
+
+            tooltip_lines = [
+                f"Path: {image.path}",
+                f"Size: {image.formatted_size}",
+                f"Modified: {image.formatted_modified}",
+                f"Status: {image.status_text}",
+            ]
+            if image.original_filename:
+                tooltip_lines.append(f"Original filename: {image.original_filename}")
+            if image.imported_at:
+                tooltip_lines.append(f"Imported: {image.imported_at}")
+            item.setToolTip("\n".join(tooltip_lines))
+            self.vault_list.addItem(item)
+
+        count = len(self.vault_images)
+        if count == 0:
+            self.vault_summary_label.setText("No images found in the app vault.")
+        elif count == 1:
+            self.vault_summary_label.setText("1 image found in the app vault.")
+        else:
+            self.vault_summary_label.setText(f"{count} images found in the app vault.")
+
+        if select_path is not None:
+            select_text = str(select_path)
+            for index in range(self.vault_list.count()):
+                item = self.vault_list.item(index)
+                if item.data(256) == select_text:
+                    self.vault_list.setCurrentItem(item)
+                    break
+
+        self._refresh_drive_status()
+        self._log(f"Vault refreshed. Found {count} image(s).")
+
+    def _get_selected_vault_path(self) -> Path | None:
+        item = self.vault_list.currentItem()
+        if item is None:
+            return None
+
+        image_path = item.data(256)
+        if not image_path:
+            return None
+
+        return Path(image_path)
+
+    def _on_vault_selection_changed(self) -> None:
+        selected_path = self._get_selected_vault_path()
+        self.delete_vault_btn.setEnabled(selected_path is not None)
+
+        if selected_path is None:
+            return
+
+        self.image_path_edit.setText(str(selected_path))
+        self._log(f"Selected vault image: {selected_path}")
+
+    def _delete_selected_vault_image(self) -> None:
+        selected_path = self._get_selected_vault_path()
+        if selected_path is None:
+            QMessageBox.information(
+                self,
+                "No image selected",
+                "Select an image in the vault list before trying to delete it.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete image",
+            f"Delete this image from the vault?\n\n{selected_path.name}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            selected_path.unlink()
+            if self.image_path_edit.text().strip() == str(selected_path):
+                self.image_path_edit.clear()
+            self._refresh_vault()
+            self._set_status("Vault image deleted.")
+            self._log(f"Deleted vault image: {selected_path}")
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Delete failed",
+                f"Could not delete the selected image:\n{exc}",
+            )
+            self._log(f"Delete failed for vault image {selected_path}: {exc}")
+
+    def _copy_file_with_progress(self, source_path: Path, target_path: Path) -> None:
+        total_size = source_path.stat().st_size
+        bytes_copied = 0
+        chunk_size = 8 * 1024 * 1024
+
+        progress = QProgressDialog("Importing image into vault...", None, 0, 100, self)
+        progress.setWindowTitle("Importing Image")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        try:
+            with source_path.open("rb") as src, target_path.open("wb") as dst:
+                while True:
+                    chunk = src.read(chunk_size)
+                    if not chunk:
+                        break
+
+                    dst.write(chunk)
+                    bytes_copied += len(chunk)
+
+                    if total_size > 0:
+                        percent = min(100, int((bytes_copied / total_size) * 100))
+                    else:
+                        percent = 100
+
+                    progress.setValue(percent)
+                    progress.setLabelText(
+                        f"Importing image into vault...\n{source_path.name}\n{format_bytes(bytes_copied)} of {format_bytes(total_size)}"
+                    )
+                    QApplication.processEvents()
+
+            copystat(source_path, target_path)
+            progress.setValue(100)
+            QApplication.processEvents()
+        except Exception:
+            if target_path.exists():
+                try:
+                    target_path.unlink()
+                except OSError:
+                    pass
+            raise
+        finally:
+            progress.close()
+
+    def _import_image_into_vault(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import image into vault",
+            str(self.vault_path),
+            "Image Files (*.img);;All Files (*.*)",
+        )
+        if not filename:
+            return
+
+        source_path = Path(filename)
+        if not source_path.exists() or not source_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Image file not found",
+                "The selected image file does not exist or is not a normal file.",
+            )
+            return
+
+        shrunk_reply = QMessageBox.question(
+            self,
+            "Already shrunk?",
+            "Is this image already shrunk?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.No,
+        )
+        if shrunk_reply == QMessageBox.Cancel:
+            return
+
+        is_shrunk = shrunk_reply == QMessageBox.Yes
+        shrink_after_import = False
+
+        if not is_shrunk:
+            shrink_reply = QMessageBox.question(
+                self,
+                "Shrink after import?",
+                "Import this image and immediately start shrinking the vault copy?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            shrink_after_import = shrink_reply == QMessageBox.Yes
+
+        try:
+            if source_path.parent.resolve() == self.vault_path.resolve():
+                target_path = source_path
+            else:
+                target_path = next_available_image_path(self.vault_path, source_path.name)
+                self._set_status("Importing image into vault...")
+                self._copy_file_with_progress(source_path, target_path)
+
+            record_import_metadata(
+                self.vault_path,
+                target_path.name,
+                is_shrunk=is_shrunk,
+                original_filename=source_path.name,
+            )
+
+            self._refresh_vault(select_path=target_path)
+            self.image_path_edit.setText(str(target_path))
+            self._log(f"Imported image into vault: {target_path}")
+            self._set_status("Import completed.")
+
+            if shrink_after_import:
+                self.delete_source_after_successful_shrink = target_path
+                self._start_operation("shrink")
+        except OSError as exc:
+            QMessageBox.critical(self, "Import failed", f"Could not import image: {exc}")
+            self._log(f"Import failed: {exc}")
+            self._set_status("Import failed.")
 
     def _start_operation(self, operation_name: str) -> None:
         if self.timer.isActive() or self.shrink_poll_timer.isActive():
@@ -459,7 +788,26 @@ class MainWindow(QMainWindow):
                         saved_text = describe_reduction(self.active_shrink_source_size, output_size)
                         status_text = f"Shrink completed successfully. {saved_text}"
 
+                    record_import_metadata(
+                        self.vault_path,
+                        output_path.name,
+                        is_shrunk=True,
+                        original_filename=Path(self.active_context.image_path).name if self.active_context else output_path.name,
+                    )
+
                     self._log(f"Shrunk image size: {output_size_text}")
+
+                    if (
+                        self.delete_source_after_successful_shrink is not None
+                        and self.delete_source_after_successful_shrink.exists()
+                    ):
+                        cleanup_source = self.delete_source_after_successful_shrink
+                        try:
+                            if cleanup_source.resolve() != output_path.resolve():
+                                cleanup_source.unlink()
+                                self._log(f"Removed temporary unshrunk import after successful shrink: {cleanup_source}")
+                        except OSError as exc:
+                            self._log(f"Could not remove temporary unshrunk import: {exc}")
 
             self._set_last_result(
                 status=status_text,
@@ -479,6 +827,9 @@ class MainWindow(QMainWindow):
                 self._log("PiShrink output:")
                 self._log(stdout.strip())
             self._record_recent_job("Completed", completed_name)
+            if plan is not None:
+                self._refresh_vault(select_path=Path(plan.output_path_windows))
+                self.image_path_edit.setText(plan.output_path_windows)
         else:
             self.controller.fail_operation()
             self._refresh_queue()
@@ -596,6 +947,7 @@ class MainWindow(QMainWindow):
         self.progress_value = 0
         self.shrink_progress_value = 0
         self.shrink_final_stage_logged = False
+        self.delete_source_after_successful_shrink = None
 
     def _refresh_queue(self) -> None:
         icons = {

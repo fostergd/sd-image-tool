@@ -7,3 +7,10 @@ build/
 *.spec
 *.egg-info/
 .aider*
+
+# App-generated image files and local vault contents
+vault-images/
+*.img
+
+# Local test artifacts
+tests/*.img
