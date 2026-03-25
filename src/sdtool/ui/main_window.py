@@ -77,6 +77,9 @@ class MainWindow(QMainWindow):
         self.vault_path = default_vault_path()
         self.vault_images: list[VaultImage] = []
 
+        self.current_disk_mode = "generic"
+        self.has_available_disks = False
+
         self._build_ui()
         self._load_devices()
         self._refresh_vault()
@@ -142,16 +145,20 @@ class MainWindow(QMainWindow):
         root.addLayout(bottom_layout, 1)
 
     def _build_sources_group(self) -> QGroupBox:
-        group = QGroupBox("Sources / Targets / Files")
+        group = QGroupBox("Device / File")
         layout = QGridLayout(group)
 
-        layout.addWidget(QLabel("Source SD/Card Reader"), 0, 0)
-        self.source_combo = QComboBox()
-        layout.addWidget(self.source_combo, 0, 1)
+        self.disk_role_label = QLabel("SD/Card Reader")
+        layout.addWidget(self.disk_role_label, 0, 0)
 
-        layout.addWidget(QLabel("Target SD/Card Reader"), 1, 0)
-        self.target_combo = QComboBox()
-        layout.addWidget(self.target_combo, 1, 1)
+        self.disk_combo = QComboBox()
+        layout.addWidget(self.disk_combo, 0, 1)
+
+        self.disk_hint_label = QLabel(
+            "Used as source for Save and as target for Write / Verify. Shrink ignores this field."
+        )
+        self.disk_hint_label.setWordWrap(True)
+        layout.addWidget(self.disk_hint_label, 1, 0, 1, 3)
 
         layout.addWidget(QLabel("Image File"), 2, 0)
         self.image_path_edit = QLineEdit("")
@@ -213,19 +220,19 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(group)
 
         self.write_btn = QPushButton("Write Image to SD Card")
-        self.write_btn.clicked.connect(lambda: self._start_operation("write"))
+        self.write_btn.clicked.connect(self._start_write_operation)
         layout.addWidget(self.write_btn)
 
         self.save_btn = QPushButton("Save SD Card to Image")
-        self.save_btn.clicked.connect(lambda: self._start_operation("save"))
+        self.save_btn.clicked.connect(self._start_save_operation)
         layout.addWidget(self.save_btn)
 
         self.shrink_btn = QPushButton("Shrink Existing Image")
-        self.shrink_btn.clicked.connect(lambda: self._start_operation("shrink"))
+        self.shrink_btn.clicked.connect(self._start_shrink_operation)
         layout.addWidget(self.shrink_btn)
 
         self.verify_btn = QPushButton("Verify Last Write")
-        self.verify_btn.clicked.connect(lambda: self._start_operation("verify"))
+        self.verify_btn.clicked.connect(self._start_verify_operation)
         layout.addWidget(self.verify_btn)
 
         self.cancel_btn = QPushButton("Cancel Current Task")
@@ -337,30 +344,92 @@ class MainWindow(QMainWindow):
             self.image_path_edit.setText(filename)
             self._log(f"Selected image path: {filename}")
 
+    def _normalized_device_label(self, label: str) -> str:
+        return label.replace(" - Source", "").replace(" - Target", "")
+
+    def _set_disk_selector_mode(self, mode: str) -> None:
+        self.current_disk_mode = mode
+
+        if mode == "save":
+            self.disk_role_label.setText("Source SD/Card Reader")
+            self.disk_hint_label.setText(
+                "Choose the SD/card reader to read from for Save SD Card to Image."
+            )
+            self.disk_combo.setEnabled(self.has_available_disks)
+            return
+
+        if mode == "write":
+            self.disk_role_label.setText("Target SD/Card Reader")
+            self.disk_hint_label.setText(
+                "Choose the SD/card reader to write the selected image to."
+            )
+            self.disk_combo.setEnabled(self.has_available_disks)
+            return
+
+        if mode == "verify":
+            self.disk_role_label.setText("Target SD/Card Reader")
+            self.disk_hint_label.setText(
+                "Choose the SD/card reader to verify against the selected image."
+            )
+            self.disk_combo.setEnabled(self.has_available_disks)
+            return
+
+        if mode == "shrink":
+            self.disk_role_label.setText("SD/Card Reader")
+            self.disk_hint_label.setText(
+                "Shrink uses only the selected image file. No SD/card reader is needed."
+            )
+            self.disk_combo.setEnabled(False)
+            return
+
+        self.disk_role_label.setText("SD/Card Reader")
+        self.disk_hint_label.setText(
+            "Used as source for Save and as target for Write / Verify. Shrink ignores this field."
+        )
+        self.disk_combo.setEnabled(self.has_available_disks)
+
+    def _selected_disk_label(self) -> str:
+        if self.disk_combo.currentData() is None:
+            return "(none)"
+        return self.disk_combo.currentText()
+
     def _load_devices(self) -> None:
+        current_disk_id = self.disk_combo.currentData() if hasattr(self, "disk_combo") else None
+
         source_devices = self.backend.list_source_devices()
         target_devices = self.backend.list_target_devices()
 
-        self.source_combo.clear()
-        if not source_devices:
-            self.source_combo.addItem("No removable disks found", None)
-            self.source_combo.setEnabled(False)
-        else:
-            for device in source_devices:
-                self.source_combo.addItem(device.label(), device.device_id)
-            self.source_combo.setEnabled(True)
+        unified_devices: list[tuple[str, str | None]] = []
+        seen_labels: set[str] = set()
 
-        self.target_combo.clear()
-        if not target_devices:
-            self.target_combo.addItem("No removable disks found", None)
-            self.target_combo.setEnabled(False)
-        else:
-            for device in target_devices:
-                self.target_combo.addItem(device.label(), device.device_id)
-            self.target_combo.setEnabled(True)
+        for device in [*source_devices, *target_devices]:
+            label = self._normalized_device_label(device.label())
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            unified_devices.append((label, device.device_id))
 
+        self.disk_combo.clear()
+
+        if not unified_devices:
+            self.has_available_disks = False
+            self.disk_combo.addItem("No removable disks found", None)
+            self._set_status("No removable disks detected. Insert a card reader or click Refresh Device List.")
+        else:
+            self.has_available_disks = True
+            for label, device_id in unified_devices:
+                self.disk_combo.addItem(label, device_id)
+
+            if current_disk_id is not None:
+                for index in range(self.disk_combo.count()):
+                    if self.disk_combo.itemData(index) == current_disk_id:
+                        self.disk_combo.setCurrentIndex(index)
+                        break
+
+            self._set_status("Device list refreshed.")
+
+        self._set_disk_selector_mode(self.current_disk_mode)
         self._log("Refreshed device list from backend.")
-        self._set_status("Device list refreshed.")
 
     def _refresh_drive_status(self) -> None:
         try:
@@ -591,11 +660,28 @@ class MainWindow(QMainWindow):
 
             if shrink_after_import:
                 self.delete_source_after_successful_shrink = target_path
+                self._set_disk_selector_mode("shrink")
                 self._start_operation("shrink")
         except OSError as exc:
             QMessageBox.critical(self, "Import failed", f"Could not import image: {exc}")
             self._log(f"Import failed: {exc}")
             self._set_status("Import failed.")
+
+    def _start_save_operation(self) -> None:
+        self._set_disk_selector_mode("save")
+        self._start_operation("save")
+
+    def _start_write_operation(self) -> None:
+        self._set_disk_selector_mode("write")
+        self._start_operation("write")
+
+    def _start_shrink_operation(self) -> None:
+        self._set_disk_selector_mode("shrink")
+        self._start_operation("shrink")
+
+    def _start_verify_operation(self) -> None:
+        self._set_disk_selector_mode("verify")
+        self._start_operation("verify")
 
     def _start_operation(self, operation_name: str) -> None:
         if self.timer.isActive() or self.shrink_poll_timer.isActive():
@@ -606,10 +692,22 @@ class MainWindow(QMainWindow):
             )
             return
 
+        selected_disk_id = self.disk_combo.currentData()
+
+        if operation_name in {"save", "write", "verify"} and selected_disk_id is None:
+            role_text = "source SD/card reader" if operation_name == "save" else "target SD/card reader"
+            QMessageBox.warning(
+                self,
+                "Cannot start operation",
+                f"A {role_text} is required for this operation.",
+            )
+            self._log(f"Operation '{operation_name}' was blocked because no device was selected.")
+            return
+
         context = OperationContext(
             operation_name=operation_name,
-            source_device_id=self.source_combo.currentData(),
-            target_device_id=self.target_combo.currentData(),
+            source_device_id=selected_disk_id if operation_name == "save" else None,
+            target_device_id=selected_disk_id if operation_name in {"write", "verify"} else None,
             image_path=self.image_path_edit.text().strip(),
         )
 
@@ -642,8 +740,18 @@ class MainWindow(QMainWindow):
         self.controller.start_operation(context.operation_name, step_definitions)
         self.active_operation = context.operation_name
         self.active_context = context
-        self.active_source_label = self.source_combo.currentText()
-        self.active_target_label = self.target_combo.currentText()
+
+        selected_label = self._selected_disk_label()
+        if context.operation_name == "save":
+            self.active_source_label = selected_label
+            self.active_target_label = ""
+        elif context.operation_name in {"write", "verify"}:
+            self.active_source_label = ""
+            self.active_target_label = selected_label
+        else:
+            self.active_source_label = ""
+            self.active_target_label = ""
+
         self.progress_value = 1
         self.progress_bar.setValue(0)
         self._refresh_queue()
@@ -705,8 +813,8 @@ class MainWindow(QMainWindow):
         self.controller.set_running_step(1)
         self.active_operation = "shrink"
         self.active_context = context
-        self.active_source_label = self.source_combo.currentText()
-        self.active_target_label = self.target_combo.currentText()
+        self.active_source_label = ""
+        self.active_target_label = ""
         self.active_shrink_plan = plan
         self.active_shrink_source_size = source_size
         self.shrink_progress_value = 15
@@ -767,7 +875,9 @@ class MainWindow(QMainWindow):
             if self.shrink_progress_value >= 90:
                 self._set_status("Finishing shrink and truncating image... this can sit near 90% for a while.")
                 if not self.shrink_final_stage_logged:
-                    self._log("Shrink has reached the final stage. It may sit near 90% while PiShrink finishes filesystem work and truncates the image.")
+                    self._log(
+                        "Shrink has reached the final stage. It may sit near 90% while PiShrink finishes filesystem work and truncates the image."
+                    )
                     self.shrink_final_stage_logged = True
             else:
                 self._set_status(
@@ -808,7 +918,9 @@ class MainWindow(QMainWindow):
                         self.vault_path,
                         output_path.name,
                         is_shrunk=True,
-                        original_filename=Path(self.active_context.image_path).name if self.active_context else output_path.name,
+                        original_filename=Path(self.active_context.image_path).name
+                        if self.active_context
+                        else output_path.name,
                     )
 
                     self._log(f"Shrunk image size: {output_size_text}")
@@ -821,13 +933,17 @@ class MainWindow(QMainWindow):
                         try:
                             if cleanup_source.resolve() != output_path.resolve():
                                 cleanup_source.unlink()
-                                self._log(f"Removed temporary unshrunk import after successful shrink: {cleanup_source}")
+                                self._log(
+                                    f"Removed temporary unshrunk import after successful shrink: {cleanup_source}"
+                                )
                         except OSError as exc:
                             self._log(f"Could not remove temporary unshrunk import: {exc}")
 
             self._set_last_result(
                 status=status_text,
-                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
+                original_size=format_bytes(self.active_shrink_source_size)
+                if self.active_shrink_source_size is not None
+                else "-",
                 output_size=output_size_text,
                 saved=saved_text,
                 output_path=output_path_text,
@@ -852,7 +968,9 @@ class MainWindow(QMainWindow):
             self._set_status("Shrink failed.")
             self._set_last_result(
                 status="Shrink failed.",
-                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
+                original_size=format_bytes(self.active_shrink_source_size)
+                if self.active_shrink_source_size is not None
+                else "-",
                 output_path=plan.output_path_windows if plan is not None else "-",
             )
             self._log(f"WSL shrink failed with return code {returncode}.")
@@ -901,8 +1019,12 @@ class MainWindow(QMainWindow):
             self._set_status(f"Cancelled '{failed_name}'.")
             self._set_last_result(
                 status="Shrink cancelled." if failed_name == "shrink" else f"{failed_name} cancelled.",
-                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
-                output_path=self.active_shrink_plan.output_path_windows if self.active_shrink_plan is not None else "-",
+                original_size=format_bytes(self.active_shrink_source_size)
+                if self.active_shrink_source_size is not None
+                else "-",
+                output_path=self.active_shrink_plan.output_path_windows
+                if self.active_shrink_plan is not None
+                else "-",
             )
             self._log(f"Cancelled real WSL shrink operation: {failed_name}")
             if stdout.strip():
