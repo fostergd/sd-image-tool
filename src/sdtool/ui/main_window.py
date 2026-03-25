@@ -342,12 +342,22 @@ class MainWindow(QMainWindow):
         target_devices = self.backend.list_target_devices()
 
         self.source_combo.clear()
-        for device in source_devices:
-            self.source_combo.addItem(device.label(), device.device_id)
+        if not source_devices:
+            self.source_combo.addItem("No removable disks found", None)
+            self.source_combo.setEnabled(False)
+        else:
+            for device in source_devices:
+                self.source_combo.addItem(device.label(), device.device_id)
+            self.source_combo.setEnabled(True)
 
         self.target_combo.clear()
-        for device in target_devices:
-            self.target_combo.addItem(device.label(), device.device_id)
+        if not target_devices:
+            self.target_combo.addItem("No removable disks found", None)
+            self.target_combo.setEnabled(False)
+        else:
+            for device in target_devices:
+                self.target_combo.addItem(device.label(), device.device_id)
+            self.target_combo.setEnabled(True)
 
         self._log("Refreshed device list from backend.")
         self._set_status("Device list refreshed.")
@@ -602,6 +612,12 @@ class MainWindow(QMainWindow):
             target_device_id=self.target_combo.currentData(),
             image_path=self.image_path_edit.text().strip(),
         )
+
+        warnings = self.backend.validate_operation(context)
+        if warnings:
+            QMessageBox.warning(self, "Cannot start operation", "\n".join(warnings))
+            self._log(f"Operation '{context.operation_name}' was blocked by validation.")
+            return
 
         if operation_name == "shrink":
             self._start_real_shrink_operation(context)

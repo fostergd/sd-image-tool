@@ -91,4 +91,7 @@ class MockBackend(BackendInterface):
         if context.operation_name in {"save", "shrink", "write"} and not context.image_path.strip():
             warnings.append("An image path is required for this operation.")
 
+        if context.source_device_id and context.source_device_id == context.target_device_id:
+            warnings.append("Source and target devices cannot be the same.")
+
         return warnings

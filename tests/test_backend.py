@@ -40,3 +40,19 @@ def test_mock_backend_requires_image_path_for_write_related_operations() -> None
 
     assert warnings
     assert "image path" in warnings[0].lower()
+
+
+def test_mock_backend_blocks_same_source_and_target_device() -> None:
+    backend = MockBackend()
+
+    warnings = backend.validate_operation(
+        OperationContext(
+            operation_name="write",
+            source_device_id="PHYSICALDRIVE2",
+            target_device_id="PHYSICALDRIVE2",
+            image_path="D:\\vault-images\\test.img",
+        )
+    )
+
+    assert warnings
+    assert "same" in warnings[0].lower()
