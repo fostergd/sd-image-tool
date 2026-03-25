@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 
 from sdtool.models import DeviceInfo, mock_source_devices, mock_target_devices
+from sdtool.windows_disks import get_windows_disks
 
 OperationSteps = list[tuple[str, str]]
 
@@ -63,11 +65,19 @@ class MockBackend(BackendInterface):
     def __init__(self, operation_steps: dict[str, OperationSteps] | None = None) -> None:
         self._operation_steps = operation_steps or DEFAULT_OPERATION_STEPS
 
+    def _discover_windows_removable_disks(self) -> list[DeviceInfo]:
+        try:
+            return get_windows_disks(Path(__file__).resolve())
+        except Exception:
+            return []
+
     def list_source_devices(self) -> list[DeviceInfo]:
-        return mock_source_devices()
+        discovered = self._discover_windows_removable_disks()
+        return discovered or mock_source_devices()
 
     def list_target_devices(self) -> list[DeviceInfo]:
-        return mock_target_devices()
+        discovered = self._discover_windows_removable_disks()
+        return discovered or mock_target_devices()
 
     def get_operation_steps(self, operation_name: str) -> OperationSteps:
         try:
