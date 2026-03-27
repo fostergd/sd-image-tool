@@ -10,11 +10,12 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -36,6 +38,7 @@ from sdtool.image_vault import (
     record_import_metadata,
     scan_vault,
 )
+from sdtool.windows_raw import CopyCancelledError, copy_physical_drive_to_image, get_physical_drive_size_bytes
 from sdtool.workflow import StepStatus, WorkflowController
 from sdtool.wsl_shrink import (
     WslCommandPlan,
@@ -44,12 +47,14 @@ from sdtool.wsl_shrink import (
     start_pishrink_process,
 )
 
+MOCK_SAVE_MARKER = "SD IMAGE TOOL MOCK SAVE PLACEHOLDER"
+
 
 class MainWindow(QMainWindow):
     def __init__(self, backend: BackendInterface | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("SD Image Tool - Mock Backend")
-        self.resize(1180, 700)
+        self.setWindowTitle("SD Image Tool")
+        self.resize(930, 575)
 
         self.backend = backend or MockBackend()
         self.controller = WorkflowController()
@@ -74,139 +79,161 @@ class MainWindow(QMainWindow):
         self.shrink_final_stage_logged = False
         self.delete_source_after_successful_shrink: Path | None = None
 
+        self.copy_cancel_requested = False
+        self.active_copy_output_path: Path | None = None
+
         self.vault_path = default_vault_path()
         self.vault_images: list[VaultImage] = []
 
         self.current_disk_mode = "generic"
         self.has_available_disks = False
+        self.shrink_ready = False
 
         self._build_ui()
         self._load_devices()
         self._refresh_vault()
-        self._log("Mock backend is enabled for save/write/verify. Shrink can run in real WSL mode.")
+        self._refresh_shrink_readiness(log_result=False)
+        self._set_disk_selector_mode("generic")
+        self._refresh_action_button_states()
+        self._log("Real save is enabled. Write and Verify remain mocked. Shrink can run in real WSL mode.")
         self._log(f"Image vault folder: {self.vault_path}")
-        self._set_status("Ready. Safe mock backend active.")
+        self._set_status("Ready. Real save enabled. Write/Verify mocked.")
 
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setSpacing(10)
+        root.setSpacing(6)
+        root.setContentsMargins(6, 6, 6, 6)
 
         top_notice = QLabel(
-            "This build is intentionally non-destructive for disk access. "
-            "Save, Write, and Verify are mocked. Shrink can run through WSL PiShrink."
+            "Save reads the selected SD card into an image file. "
+            "Write and Verify are still mocked. Shrink can run through WSL PiShrink."
         )
         top_notice.setWordWrap(True)
         root.addWidget(top_notice)
 
-        main_row = QHBoxLayout()
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setDocumentMode(True)
+        self.main_tabs.addTab(self._build_operations_tab(), "Operations")
+        self.main_tabs.addTab(self._build_details_tab(), "Details / History")
+        root.addWidget(self.main_tabs, 1)
 
-        main_row.addWidget(self._build_vault_group(), 1)
+        root.addWidget(self._build_footer_bar(), 0)
+
+    def _build_operations_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        layout.addWidget(self._build_vault_group(), 7)
 
         right_column = QVBoxLayout()
+        right_column.setSpacing(6)
+        right_column.addWidget(self._build_sources_group(), 0)
+        right_column.addWidget(self._build_actions_group(), 0)
+        right_column.addStretch(1)
 
-        upper_right = QHBoxLayout()
-        upper_right.addWidget(self._build_sources_group(), 3)
-        upper_right.addWidget(self._build_actions_group(), 2)
-        right_column.addLayout(upper_right)
+        layout.addLayout(right_column, 4)
+        return tab
 
-        status_row = QHBoxLayout()
+    def _build_details_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
-        status_left_column = QVBoxLayout()
+        top_row = QHBoxLayout()
+        top_row.setSpacing(6)
+        top_row.addWidget(self._build_shrink_readiness_group(), 2)
+        top_row.addWidget(self._build_last_result_group(), 3)
+        layout.addLayout(top_row)
 
-        progress_group = QGroupBox("Current Status")
-        progress_layout = QVBoxLayout(progress_group)
-        self.status_label = QLabel("Ready.")
-        self.status_label.setWordWrap(True)
-        progress_layout.addWidget(self.status_label)
+        bottom_row = QHBoxLayout()
+        bottom_row.setSpacing(6)
+        bottom_row.addWidget(self._build_queue_group(), 2)
+        bottom_row.addWidget(self._build_recent_jobs_group(), 2)
+        bottom_row.addWidget(self._build_log_group(), 4)
+        layout.addLayout(bottom_row, 1)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        progress_layout.addWidget(self.progress_bar)
-
-        status_left_column.addWidget(progress_group)
-        status_left_column.addWidget(self._build_drive_group())
-
-        status_row.addLayout(status_left_column, 2)
-        status_row.addWidget(self._build_last_result_group(), 1)
-        right_column.addLayout(status_row)
-
-        main_row.addLayout(right_column, 3)
-
-        root.addLayout(main_row, 2)
-
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addWidget(self._build_queue_group(), 1)
-        bottom_layout.addWidget(self._build_recent_jobs_group(), 1)
-        bottom_layout.addWidget(self._build_log_group(), 2)
-        root.addLayout(bottom_layout, 1)
+        return tab
 
     def _build_sources_group(self) -> QGroupBox:
         group = QGroupBox("Device / File")
+        group.setMinimumWidth(285)
+
         layout = QGridLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
 
         self.disk_role_label = QLabel("SD/Card Reader")
         layout.addWidget(self.disk_role_label, 0, 0)
 
         self.disk_combo = QComboBox()
+        self.disk_combo.currentIndexChanged.connect(self._refresh_action_button_states)
         layout.addWidget(self.disk_combo, 0, 1)
 
-        self.disk_hint_label = QLabel(
-            "Used as source for Save and as target for Write / Verify. Shrink ignores this field."
-        )
-        self.disk_hint_label.setWordWrap(True)
-        layout.addWidget(self.disk_hint_label, 1, 0, 1, 3)
+        self.refresh_devices_btn = QPushButton("Refresh Device List")
+        self.refresh_devices_btn.clicked.connect(self._load_devices)
+        layout.addWidget(self.refresh_devices_btn, 1, 1)
 
-        layout.addWidget(QLabel("Image File"), 2, 0)
-        self.image_path_edit = QLineEdit("")
-        self.image_path_edit.setPlaceholderText("Select or browse to an image file (.img)")
-        layout.addWidget(self.image_path_edit, 2, 1)
+        layout.setRowMinimumHeight(2, 10)
 
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self._browse_image_path)
-        layout.addWidget(browse_btn, 2, 2)
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator, 3, 0, 1, 2)
 
-        refresh_btn = QPushButton("Refresh Device List")
-        refresh_btn.clicked.connect(self._load_devices)
-        layout.addWidget(refresh_btn, 3, 1)
+        layout.setRowMinimumHeight(4, 10)
 
+        layout.addWidget(QLabel("Selected Image"), 5, 0)
+        self.selected_image_value = QLabel("(none)")
+        self.selected_image_value.setWordWrap(True)
+        layout.addWidget(self.selected_image_value, 5, 1)
+
+        layout.setColumnStretch(1, 1)
         return group
 
     def _build_vault_group(self) -> QGroupBox:
         group = QGroupBox("Vault Images")
+        group.setMinimumWidth(360)
+
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
 
         path_label = QLabel(f"Stored with the app in:\n{self.vault_path}")
         path_label.setWordWrap(True)
         layout.addWidget(path_label)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
 
-        import_btn = QPushButton("Import Image")
-        import_btn.clicked.connect(self._import_image_into_vault)
-        toolbar.addWidget(import_btn)
+        self.import_btn = QPushButton("Import Image")
+        self.import_btn.clicked.connect(self._import_image_into_vault)
+        toolbar.addWidget(self.import_btn)
 
         self.delete_vault_btn = QPushButton("Delete Selected")
         self.delete_vault_btn.clicked.connect(self._delete_selected_vault_image)
         self.delete_vault_btn.setEnabled(False)
         toolbar.addWidget(self.delete_vault_btn)
 
-        refresh_btn = QPushButton("Refresh Vault")
-        refresh_btn.clicked.connect(self._refresh_vault)
-        toolbar.addWidget(refresh_btn)
+        self.refresh_vault_btn = QPushButton("Refresh Vault")
+        self.refresh_vault_btn.clicked.connect(self._refresh_vault)
+        toolbar.addWidget(self.refresh_vault_btn)
 
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
         self.vault_list = QListWidget()
         self.vault_list.itemSelectionChanged.connect(self._on_vault_selection_changed)
-        self.vault_list.setMinimumWidth(285)
-        self.vault_list.setMinimumHeight(0)
+        self.vault_list.setMinimumWidth(320)
+        self.vault_list.setMinimumHeight(395)
         self.vault_list.setWordWrap(True)
-        self.vault_list.setSpacing(4)
+        self.vault_list.setSpacing(2)
         layout.addWidget(self.vault_list, 1)
 
         self.vault_summary_label = QLabel("No images found in vault.")
@@ -217,82 +244,68 @@ class MainWindow(QMainWindow):
 
     def _build_actions_group(self) -> QGroupBox:
         group = QGroupBox("Actions")
-        layout = QVBoxLayout(group)
+        group.setMinimumWidth(285)
 
-        self.write_btn = QPushButton("Write Image to SD Card")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(22)
+
+        self.write_btn = QPushButton("Write Selected Image to SD Card")
+        self.write_btn.setMinimumHeight(48)
         self.write_btn.clicked.connect(self._start_write_operation)
         layout.addWidget(self.write_btn)
 
-        self.save_btn = QPushButton("Save SD Card to Image")
+        self.save_btn = QPushButton("Save SD Card to Image File")
+        self.save_btn.setMinimumHeight(48)
         self.save_btn.clicked.connect(self._start_save_operation)
         layout.addWidget(self.save_btn)
 
-        self.shrink_btn = QPushButton("Shrink Existing Image")
+        self.shrink_btn = QPushButton("Shrink Selected Image File")
+        self.shrink_btn.setMinimumHeight(48)
         self.shrink_btn.clicked.connect(self._start_shrink_operation)
         layout.addWidget(self.shrink_btn)
 
-        self.verify_btn = QPushButton("Verify Last Write")
+        self.verify_btn = QPushButton("Verify Selected Image Against SD Card")
+        self.verify_btn.setMinimumHeight(48)
         self.verify_btn.clicked.connect(self._start_verify_operation)
         layout.addWidget(self.verify_btn)
 
         self.cancel_btn = QPushButton("Cancel Current Task")
+        self.cancel_btn.setMinimumHeight(48)
         self.cancel_btn.clicked.connect(self._cancel_operation)
         layout.addWidget(self.cancel_btn)
 
-        layout.addStretch(1)
         return group
 
-    def _build_drive_group(self) -> QGroupBox:
-        group = QGroupBox("Tool Drive Status")
-        layout = QVBoxLayout(group)
+    def _build_shrink_readiness_group(self) -> QGroupBox:
+        group = QGroupBox("Shrink Readiness")
+        group.setMinimumHeight(92)
 
-        self.drive_size_value = QLabel("Drive Size: -")
-        self.drive_size_value.setWordWrap(True)
-        layout.addWidget(self.drive_size_value)
+        layout = QGridLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
 
-        self.drive_free_value = QLabel("Drive Free Space: -")
-        self.drive_free_value.setWordWrap(True)
-        layout.addWidget(self.drive_free_value)
+        layout.addWidget(QLabel("WSL + PiShrink"), 0, 0)
+        self.shrink_readiness_value = QLabel("Checking...")
+        self.shrink_readiness_value.setWordWrap(True)
+        layout.addWidget(self.shrink_readiness_value, 0, 1)
 
-        self.vault_size_value = QLabel("Vault Size: -")
-        self.vault_size_value.setWordWrap(True)
-        layout.addWidget(self.vault_size_value)
+        self.refresh_shrink_readiness_btn = QPushButton("Re-check Shrink Readiness")
+        self.refresh_shrink_readiness_btn.clicked.connect(self._refresh_shrink_readiness)
+        layout.addWidget(self.refresh_shrink_readiness_btn, 1, 0, 1, 2)
 
-        return group
-
-    def _build_queue_group(self) -> QGroupBox:
-        group = QGroupBox("Planned / Running Steps")
-        layout = QVBoxLayout(group)
-        self.queue_list = QListWidget()
-        layout.addWidget(self.queue_list)
-        return group
-
-    def _build_recent_jobs_group(self) -> QGroupBox:
-        group = QGroupBox("Recent Jobs")
-        layout = QVBoxLayout(group)
-
-        help_label = QLabel(
-            "Completed, failed, and cancelled operations appear here with the device selections and image path used."
-        )
-        help_label.setWordWrap(True)
-        layout.addWidget(help_label)
-
-        self.recent_jobs_list = QListWidget()
-        layout.addWidget(self.recent_jobs_list)
-
-        return group
-
-    def _build_log_group(self) -> QGroupBox:
-        group = QGroupBox("Activity Log")
-        layout = QVBoxLayout(group)
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        layout.addWidget(self.log_view)
+        layout.setColumnStretch(1, 1)
         return group
 
     def _build_last_result_group(self) -> QGroupBox:
         group = QGroupBox("Last Shrink Result")
+        group.setMinimumHeight(150)
+
         layout = QGridLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(4)
 
         layout.addWidget(QLabel("Status"), 0, 0)
         self.result_status_value = QLabel("No shrink completed yet.")
@@ -316,12 +329,144 @@ class MainWindow(QMainWindow):
         self.result_output_path_value.setWordWrap(True)
         layout.addWidget(self.result_output_path_value, 4, 1)
 
+        layout.setColumnStretch(1, 1)
         return group
+
+    def _build_queue_group(self) -> QGroupBox:
+        group = QGroupBox("Planned / Running Steps")
+        group.setMinimumHeight(245)
+
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+        self.queue_list = QListWidget()
+        layout.addWidget(self.queue_list)
+        return group
+
+    def _build_recent_jobs_group(self) -> QGroupBox:
+        group = QGroupBox("Recent Jobs")
+        group.setMinimumHeight(245)
+
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+
+        help_label = QLabel(
+            "Completed, failed, and cancelled operations appear here with the device selections and image path used."
+        )
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
+        self.recent_jobs_list = QListWidget()
+        layout.addWidget(self.recent_jobs_list)
+
+        return group
+
+    def _build_log_group(self) -> QGroupBox:
+        group = QGroupBox("Activity Log")
+        group.setMinimumHeight(245)
+
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        layout.addWidget(self.log_view)
+        return group
+
+    def _build_footer_bar(self) -> QWidget:
+        footer = QGroupBox("Status")
+        footer.setMaximumHeight(126)
+
+        layout = QGridLayout(footer)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(4)
+
+        layout.addWidget(QLabel("Current Status"), 0, 0)
+        self.status_label = QLabel("Ready.")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label, 0, 1, 1, 5)
+
+        layout.addWidget(QLabel("Progress"), 1, 0)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar, 1, 1, 2, 2)
+
+        drive_size_title = QLabel("Drive Size")
+        drive_size_title.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+        layout.addWidget(drive_size_title, 1, 3)
+        self.drive_size_value = QLabel("-")
+        self.drive_size_value.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.drive_size_value.setWordWrap(True)
+        layout.addWidget(self.drive_size_value, 2, 3)
+
+        drive_free_title = QLabel("Drive Free Space")
+        drive_free_title.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+        layout.addWidget(drive_free_title, 1, 4)
+        self.drive_free_value = QLabel("-")
+        self.drive_free_value.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.drive_free_value.setWordWrap(True)
+        layout.addWidget(self.drive_free_value, 2, 4)
+
+        vault_size_title = QLabel("Vault Size")
+        vault_size_title.setAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+        layout.addWidget(vault_size_title, 1, 5)
+        self.vault_size_value = QLabel("-")
+        self.vault_size_value.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.vault_size_value.setWordWrap(True)
+        layout.addWidget(self.vault_size_value, 2, 5)
+
+        layout.setColumnStretch(1, 3)
+        layout.setColumnStretch(2, 2)
+        layout.setColumnStretch(3, 1)
+        layout.setColumnStretch(4, 1)
+        layout.setColumnStretch(5, 1)
+
+        return footer
+
+    def closeEvent(self, event) -> None:
+        if self.active_copy_output_path is not None and self.active_operation == "save":
+            reply = QMessageBox.question(
+                self,
+                "Operation in progress",
+                "A save is still running.\n\nCancel it first?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+            self.copy_cancel_requested = True
+            self._set_status("Cancelling 'save' before close...")
+            self._log("Close requested during real save. Cancellation requested.")
+            event.ignore()
+            return
+
+        if not self._operation_is_running():
+            event.accept()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Operation in progress",
+            "A task is still running.\n\nCancel it and close the app?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            event.ignore()
+            return
+
+        self._cancel_operation_for_close()
+        event.accept()
 
     def _set_last_result(
         self,
         *,
-        status: str,
+        status: str = "-",
         original_size: str = "-",
         output_size: str = "-",
         saved: str = "-",
@@ -333,16 +478,18 @@ class MainWindow(QMainWindow):
         self.result_saved_value.setText(saved)
         self.result_output_path_value.setText(output_path)
 
-    def _browse_image_path(self) -> None:
-        filename, _ = QFileDialog.getOpenFileName(
-            self,
-            "Choose image file",
-            self.image_path_edit.text() or str(self.vault_path),
-            "Image Files (*.img);;All Files (*.*)",
-        )
-        if filename:
-            self.image_path_edit.setText(filename)
-            self._log(f"Selected image path: {filename}")
+    def _refresh_shrink_readiness(self, *, log_result: bool = True) -> None:
+        self.shrink_ready = check_wsl_pishrink_available()
+
+        if self.shrink_ready:
+            self.shrink_readiness_value.setText("Ready")
+        else:
+            self.shrink_readiness_value.setText("Not ready")
+
+        if log_result:
+            self._log(f"Shrink readiness checked: {'ready' if self.shrink_ready else 'not ready'}")
+
+        self._refresh_action_button_states()
 
     def _normalized_device_label(self, label: str) -> str:
         return label.replace(" - Source", "").replace(" - Target", "")
@@ -352,46 +499,89 @@ class MainWindow(QMainWindow):
 
         if mode == "save":
             self.disk_role_label.setText("Source SD/Card Reader")
-            self.disk_hint_label.setText(
-                "Choose the SD/card reader to read from for Save SD Card to Image."
-            )
-            self.disk_combo.setEnabled(self.has_available_disks)
             return
 
-        if mode == "write":
+        if mode in {"write", "verify"}:
             self.disk_role_label.setText("Target SD/Card Reader")
-            self.disk_hint_label.setText(
-                "Choose the SD/card reader to write the selected image to."
-            )
-            self.disk_combo.setEnabled(self.has_available_disks)
-            return
-
-        if mode == "verify":
-            self.disk_role_label.setText("Target SD/Card Reader")
-            self.disk_hint_label.setText(
-                "Choose the SD/card reader to verify against the selected image."
-            )
-            self.disk_combo.setEnabled(self.has_available_disks)
-            return
-
-        if mode == "shrink":
-            self.disk_role_label.setText("SD/Card Reader")
-            self.disk_hint_label.setText(
-                "Shrink uses only the selected image file. No SD/card reader is needed."
-            )
-            self.disk_combo.setEnabled(False)
             return
 
         self.disk_role_label.setText("SD/Card Reader")
-        self.disk_hint_label.setText(
-            "Used as source for Save and as target for Write / Verify. Shrink ignores this field."
-        )
-        self.disk_combo.setEnabled(self.has_available_disks)
 
     def _selected_disk_label(self) -> str:
         if self.disk_combo.currentData() is None:
             return "(none)"
         return self.disk_combo.currentText()
+
+    def _selected_vault_image_path(self) -> Path | None:
+        item = self.vault_list.currentItem()
+        if item is None:
+            return None
+
+        image_path = item.data(256)
+        if not image_path:
+            return None
+
+        return Path(image_path)
+
+    def _is_mock_placeholder_image(self, image_path: Path) -> bool:
+        try:
+            with image_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                first_line = handle.readline().strip()
+            return first_line == MOCK_SAVE_MARKER
+        except OSError:
+            return False
+
+    def _operation_is_running(self) -> bool:
+        return (
+            self.active_operation is not None
+            or self.timer.isActive()
+            or self.shrink_poll_timer.isActive()
+        )
+
+    def _show_mock_placeholder_blocked_message(self, operation_name: str, image_path: Path) -> None:
+        action_name = {
+            "write": "written to an SD card",
+            "verify": "used for verify",
+            "shrink": "shrunk",
+        }.get(operation_name, "used")
+
+        QMessageBox.warning(
+            self,
+            "Cannot use mock placeholder",
+            f"The selected file was created by the mock Save flow and is not a real disk image.\n\n"
+            f"It cannot be {action_name}.",
+        )
+        self._log(f"{operation_name.capitalize()} blocked because selected image is a mock placeholder: {image_path}")
+
+    def _update_selected_image_display(self) -> None:
+        selected_path = self._selected_vault_image_path()
+        if selected_path is None:
+            self.selected_image_value.setText("(none)")
+        elif self._is_mock_placeholder_image(selected_path):
+            self.selected_image_value.setText(f"{selected_path} [Mock Placeholder]")
+        else:
+            self.selected_image_value.setText(str(selected_path))
+
+    def _refresh_action_button_states(self) -> None:
+        operation_running = self._operation_is_running() or self.active_copy_output_path is not None
+        selected_image_path = self._selected_vault_image_path()
+        selected_disk_present = self.disk_combo.currentData() is not None
+        has_real_image = selected_image_path is not None and not self._is_mock_placeholder_image(selected_image_path)
+        has_any_selected_image = selected_image_path is not None
+
+        self.save_btn.setEnabled(not operation_running and selected_disk_present)
+        self.write_btn.setEnabled(not operation_running and selected_disk_present and has_real_image)
+        self.verify_btn.setEnabled(not operation_running and selected_disk_present and has_real_image)
+        self.shrink_btn.setEnabled(not operation_running and has_real_image)
+        self.cancel_btn.setEnabled(operation_running)
+        self.delete_vault_btn.setEnabled(not operation_running and has_any_selected_image)
+        self.import_btn.setEnabled(not operation_running)
+        self.refresh_devices_btn.setEnabled(not operation_running)
+        self.refresh_vault_btn.setEnabled(not operation_running)
+        self.refresh_shrink_readiness_btn.setEnabled(not operation_running)
+        self.vault_list.setEnabled(not operation_running)
+        self.disk_combo.setEnabled(self.has_available_disks and not operation_running)
+        self.main_tabs.setEnabled(True)
 
     def _load_devices(self) -> None:
         current_disk_id = self.disk_combo.currentData() if hasattr(self, "disk_combo") else None
@@ -429,6 +619,7 @@ class MainWindow(QMainWindow):
             self._set_status("Device list refreshed.")
 
         self._set_disk_selector_mode(self.current_disk_mode)
+        self._refresh_action_button_states()
         self._log("Refreshed device list from backend.")
 
     def _refresh_drive_status(self) -> None:
@@ -437,28 +628,38 @@ class MainWindow(QMainWindow):
             usage = disk_usage(usage_target)
             vault_size = sum(image.size_bytes for image in self.vault_images)
 
-            self.drive_size_value.setText(f"Drive Size: {format_bytes(usage.total)}")
-            self.drive_free_value.setText(f"Drive Free Space: {format_bytes(usage.free)}")
-            self.vault_size_value.setText(f"Vault Size: {format_bytes(vault_size)}")
+            self.drive_size_value.setText(format_bytes(usage.total))
+            self.drive_free_value.setText(format_bytes(usage.free))
+            self.vault_size_value.setText(format_bytes(vault_size))
         except OSError as exc:
-            self.drive_size_value.setText("Drive Size: Unavailable")
-            self.drive_free_value.setText("Drive Free Space: Unavailable")
-            self.vault_size_value.setText("Vault Size: Unavailable")
+            self.drive_size_value.setText("Unavailable")
+            self.drive_free_value.setText("Unavailable")
+            self.vault_size_value.setText("Unavailable")
             self._log(f"Could not read tool drive status: {exc}")
 
     def _refresh_vault(self, *, select_path: Path | None = None) -> None:
+        current_selected_path = select_path or self._selected_vault_image_path()
+
         self.vault_images = scan_vault(self.vault_path)
         self.vault_list.clear()
         self.delete_vault_btn.setEnabled(False)
 
         for image in self.vault_images:
+            image_is_mock = self._is_mock_placeholder_image(image.path)
+
             line1 = image.filename
+            if image_is_mock:
+                line1 = f"{line1} [Mock]"
+
             line2 = f"{image.formatted_size} | {image.formatted_modified} | {image.status_text}"
+            if image_is_mock:
+                line2 = f"{line2} | Mock placeholder"
+
             text = f"{line1}\n{line2}"
 
             item = QListWidgetItem(text)
             item.setData(256, str(image.path))
-            item.setSizeHint(QSize(item.sizeHint().width(), item.sizeHint().height() + 12))
+            item.setSizeHint(QSize(item.sizeHint().width(), item.sizeHint().height() + 6))
 
             tooltip_lines = [
                 f"Path: {image.path}",
@@ -466,6 +667,8 @@ class MainWindow(QMainWindow):
                 f"Modified: {image.formatted_modified}",
                 f"Status: {image.status_text}",
             ]
+            if image_is_mock:
+                tooltip_lines.append("Mock placeholder: Yes")
             if image.original_filename:
                 tooltip_lines.append(f"Original filename: {image.original_filename}")
             if image.imported_at:
@@ -481,40 +684,34 @@ class MainWindow(QMainWindow):
         else:
             self.vault_summary_label.setText(f"{count} images found in the app vault.")
 
-        if select_path is not None:
-            select_text = str(select_path)
+        if current_selected_path is not None:
+            select_text = str(current_selected_path)
             for index in range(self.vault_list.count()):
                 item = self.vault_list.item(index)
                 if item.data(256) == select_text:
                     self.vault_list.setCurrentItem(item)
                     break
 
+        self._update_selected_image_display()
         self._refresh_drive_status()
+        self._refresh_action_button_states()
         self._log(f"Vault refreshed. Found {count} image(s).")
 
-    def _get_selected_vault_path(self) -> Path | None:
-        item = self.vault_list.currentItem()
-        if item is None:
-            return None
-
-        image_path = item.data(256)
-        if not image_path:
-            return None
-
-        return Path(image_path)
-
     def _on_vault_selection_changed(self) -> None:
-        selected_path = self._get_selected_vault_path()
-        self.delete_vault_btn.setEnabled(selected_path is not None)
+        selected_path = self._selected_vault_image_path()
+        self._update_selected_image_display()
+        self._refresh_action_button_states()
 
         if selected_path is None:
             return
 
-        self.image_path_edit.setText(str(selected_path))
-        self._log(f"Selected vault image: {selected_path}")
+        if self._is_mock_placeholder_image(selected_path):
+            self._log(f"Selected mock placeholder image: {selected_path}")
+        else:
+            self._log(f"Selected vault image: {selected_path}")
 
     def _delete_selected_vault_image(self) -> None:
-        selected_path = self._get_selected_vault_path()
+        selected_path = self._selected_vault_image_path()
         if selected_path is None:
             QMessageBox.information(
                 self,
@@ -535,8 +732,6 @@ class MainWindow(QMainWindow):
 
         try:
             selected_path.unlink()
-            if self.image_path_edit.text().strip() == str(selected_path):
-                self.image_path_edit.clear()
             self._refresh_vault()
             self._set_status("Vault image deleted.")
             self._log(f"Deleted vault image: {selected_path}")
@@ -596,6 +791,20 @@ class MainWindow(QMainWindow):
         finally:
             progress.close()
 
+    def _remove_incomplete_shrink_output(self, *, log_prefix: str) -> None:
+        if self.active_shrink_plan is None:
+            return
+
+        output_path = Path(self.active_shrink_plan.output_path_windows)
+        if not output_path.exists():
+            return
+
+        try:
+            output_path.unlink()
+            self._log(f"{log_prefix}: removed incomplete shrink output: {output_path}")
+        except OSError as exc:
+            self._log(f"{log_prefix}: could not remove incomplete shrink output {output_path}: {exc}")
+
     def _import_image_into_vault(self) -> None:
         filename, _ = QFileDialog.getOpenFileName(
             self,
@@ -654,7 +863,6 @@ class MainWindow(QMainWindow):
             )
 
             self._refresh_vault(select_path=target_path)
-            self.image_path_edit.setText(str(target_path))
             self._log(f"Imported image into vault: {target_path}")
             self._set_status("Import completed.")
 
@@ -669,10 +877,82 @@ class MainWindow(QMainWindow):
 
     def _start_save_operation(self) -> None:
         self._set_disk_selector_mode("save")
-        self._start_operation("save")
+
+        if self.disk_combo.currentData() is None:
+            QMessageBox.warning(
+                self,
+                "Cannot start operation",
+                "A source SD/card reader is required for this operation.",
+            )
+            self._log("Operation 'save' was blocked because no device was selected.")
+            return
+
+        image_name_base, ok = QInputDialog.getText(
+            self,
+            "New image name",
+            "Enter a name for the new image file.\n.img will be added automatically.",
+            text="new-image",
+        )
+        if not ok:
+            return
+
+        image_name_base = image_name_base.strip()
+        if image_name_base.lower().endswith(".img"):
+            image_name_base = image_name_base[:-4].strip()
+
+        if not image_name_base:
+            QMessageBox.warning(
+                self,
+                "Invalid image name",
+                "Enter a file name for the new image.",
+            )
+            return
+
+        image_name = f"{image_name_base}.img"
+        save_path = next_available_image_path(self.vault_path, image_name)
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm save",
+            "Read the selected SD card into a new image file?\n\n"
+            f"Source: {self._selected_disk_label()}\n"
+            f"Output: {save_path.name}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("Save operation cancelled at confirmation dialog.")
+            return
+
+        self._start_operation("save", image_path_override=str(save_path))
 
     def _start_write_operation(self) -> None:
         self._set_disk_selector_mode("write")
+
+        selected_disk_id = self.disk_combo.currentData()
+        selected_image_path = self._selected_vault_image_path()
+
+        if selected_disk_id is None or selected_image_path is None:
+            self._start_operation("write")
+            return
+
+        if self._is_mock_placeholder_image(selected_image_path):
+            self._show_mock_placeholder_blocked_message("write", selected_image_path)
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm write",
+            "Write the selected image to the selected SD card?\n\n"
+            f"Image: {selected_image_path.name}\n"
+            f"Target: {self._selected_disk_label()}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("Write operation cancelled at confirmation dialog.")
+            return
+
         self._start_operation("write")
 
     def _start_shrink_operation(self) -> None:
@@ -683,8 +963,8 @@ class MainWindow(QMainWindow):
         self._set_disk_selector_mode("verify")
         self._start_operation("verify")
 
-    def _start_operation(self, operation_name: str) -> None:
-        if self.timer.isActive() or self.shrink_poll_timer.isActive():
+    def _start_operation(self, operation_name: str, *, image_path_override: str | None = None) -> None:
+        if self.timer.isActive() or self.shrink_poll_timer.isActive() or self.active_copy_output_path is not None:
             QMessageBox.information(
                 self,
                 "Operation already running",
@@ -693,6 +973,11 @@ class MainWindow(QMainWindow):
             return
 
         selected_disk_id = self.disk_combo.currentData()
+        selected_image_path = image_path_override
+
+        if selected_image_path is None:
+            selected_vault_path = self._selected_vault_image_path()
+            selected_image_path = str(selected_vault_path) if selected_vault_path is not None else ""
 
         if operation_name in {"save", "write", "verify"} and selected_disk_id is None:
             role_text = "source SD/card reader" if operation_name == "save" else "target SD/card reader"
@@ -704,17 +989,36 @@ class MainWindow(QMainWindow):
             self._log(f"Operation '{operation_name}' was blocked because no device was selected.")
             return
 
+        if operation_name in {"write", "shrink", "verify"} and not selected_image_path.strip():
+            QMessageBox.warning(
+                self,
+                "Cannot start operation",
+                "Select an image in the vault before starting this operation.",
+            )
+            self._log(f"Operation '{operation_name}' was blocked because no image was selected.")
+            return
+
+        if operation_name in {"write", "verify", "shrink"}:
+            selected_real_path = Path(selected_image_path)
+            if self._is_mock_placeholder_image(selected_real_path):
+                self._show_mock_placeholder_blocked_message(operation_name, selected_real_path)
+                return
+
         context = OperationContext(
             operation_name=operation_name,
             source_device_id=selected_disk_id if operation_name == "save" else None,
             target_device_id=selected_disk_id if operation_name in {"write", "verify"} else None,
-            image_path=self.image_path_edit.text().strip(),
+            image_path=selected_image_path.strip(),
         )
 
         warnings = self.backend.validate_operation(context)
         if warnings:
             QMessageBox.warning(self, "Cannot start operation", "\n".join(warnings))
             self._log(f"Operation '{context.operation_name}' was blocked by validation.")
+            return
+
+        if operation_name == "save":
+            self._start_real_save_operation(context)
             return
 
         if operation_name == "shrink":
@@ -755,6 +1059,7 @@ class MainWindow(QMainWindow):
         self.progress_value = 1
         self.progress_bar.setValue(0)
         self._refresh_queue()
+        self._refresh_action_button_states()
 
         self._log(
             f"Started mock '{context.operation_name}' operation. "
@@ -765,7 +1070,144 @@ class MainWindow(QMainWindow):
         self._set_status(f"Running '{context.operation_name}' operation...")
         self.timer.start()
 
+    def _on_real_save_progress(self, bytes_copied: int, total_size: int) -> None:
+        percent = 0
+        if total_size > 0:
+            percent = min(98, int((bytes_copied / total_size) * 100))
+
+        self.progress_bar.setValue(percent)
+        self._set_status(
+            f"Saving SD card to image... {percent}% "
+            f"({format_bytes(bytes_copied)} of {format_bytes(total_size)})"
+        )
+        QApplication.processEvents()
+
+    def _start_real_save_operation(self, context: OperationContext) -> None:
+        output_path = Path(context.image_path)
+        auto_shrink_output_path: Path | None = None
+
+        try:
+            total_size = get_physical_drive_size_bytes(context.source_device_id or "")
+            if total_size is None:
+                raise RuntimeError(
+                    "Could not determine the selected device size. "
+                    "Run the app as Administrator and try again."
+                )
+
+            step_definitions = self.backend.get_operation_steps("save")
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot start save", str(exc))
+            self._log(f"Save preparation failed: {exc}")
+            return
+
+        self.controller.start_operation("save", step_definitions)
+        self.controller.set_running_step(1)
+        self.active_operation = "save"
+        self.active_context = context
+        self.active_source_label = self._selected_disk_label()
+        self.active_target_label = ""
+        self.copy_cancel_requested = False
+        self.active_copy_output_path = output_path
+        self.progress_bar.setValue(0)
+        self._refresh_queue()
+        self._refresh_action_button_states()
+
+        self._log(f"Prepared real save from: {context.source_device_id}")
+        self._log(f"Selected source device: {self.active_source_label}")
+        self._log(f"Save output image: {output_path}")
+        self._log(f"Expected image size: {format_bytes(total_size)}")
+        self._set_status("Starting SD card read to image file...")
+
+        try:
+            self.controller.set_running_step(2)
+            self._refresh_queue()
+
+            bytes_copied = copy_physical_drive_to_image(
+                context.source_device_id or "",
+                output_path,
+                progress_callback=self._on_real_save_progress,
+                cancel_callback=lambda: self.copy_cancel_requested,
+            )
+
+            self.controller.set_running_step(3)
+            self._refresh_queue()
+
+            actual_size = output_path.stat().st_size
+            if actual_size != total_size or bytes_copied != total_size:
+                raise RuntimeError(
+                    "Saved image size did not match the expected device size."
+                )
+
+            record_import_metadata(
+                self.vault_path,
+                output_path.name,
+                is_shrunk=False,
+                original_filename=self.active_source_label or output_path.name,
+            )
+
+            self.controller.complete_operation()
+            self.progress_bar.setValue(100)
+            self._refresh_queue()
+            self._refresh_vault(select_path=output_path)
+
+            self._set_status(f"Saved SD card to image successfully. {format_bytes(actual_size)}")
+            self._log(f"Completed real save operation: {output_path}")
+            self._record_recent_job("Completed", "save")
+
+            if check_wsl_pishrink_available():
+                auto_shrink_output_path = output_path
+                self._log(f"PiShrink is available. Auto-starting shrink for saved image: {output_path}")
+            else:
+                self._log("PiShrink not available. Skipping automatic shrink after save.")
+        except CopyCancelledError:
+            if output_path.exists():
+                try:
+                    output_path.unlink()
+                    self._log(f"Removed partial saved image after cancellation: {output_path}")
+                except OSError as exc:
+                    self._log(f"Could not remove partial saved image after cancellation: {exc}")
+
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self.progress_bar.setValue(0)
+            self._set_status("Cancelled 'save'.")
+            self._log("Cancelled real save operation.")
+            self._record_recent_job("Cancelled", "save")
+            self._refresh_vault()
+        except Exception as exc:
+            if output_path.exists():
+                try:
+                    output_path.unlink()
+                    self._log(f"Removed incomplete saved image after failure: {output_path}")
+                except OSError as cleanup_exc:
+                    self._log(f"Could not remove incomplete saved image after failure: {cleanup_exc}")
+
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self.progress_bar.setValue(0)
+            self._set_status("Save failed.")
+            self._log(f"Real save failed: {exc}")
+            self._record_recent_job("Failed", "save")
+            self._refresh_vault()
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                f"Could not save the SD card to an image file:\n{exc}",
+            )
+        finally:
+            self.copy_cancel_requested = False
+            self.active_copy_output_path = None
+            self._clear_active_operation_state()
+            self._refresh_action_button_states()
+
+        if auto_shrink_output_path is not None and auto_shrink_output_path.exists():
+            self._refresh_vault(select_path=auto_shrink_output_path)
+            self._set_disk_selector_mode("shrink")
+            self._start_operation("shrink")
+
     def _start_real_shrink_operation(self, context: OperationContext) -> None:
+        self._refresh_shrink_readiness(log_result=True)
+
         warnings = self.backend.validate_operation(context)
         if warnings:
             QMessageBox.warning(self, "Cannot start operation", "\n".join(warnings))
@@ -791,11 +1233,11 @@ class MainWindow(QMainWindow):
             self._log(f"Shrink blocked because the image file was not found: {context.image_path}")
             return
 
-        if not check_wsl_pishrink_available():
+        if not self.shrink_ready:
             QMessageBox.critical(
                 self,
                 "PiShrink not available",
-                "WSL PiShrink was not found. Confirm that WSL Ubuntu and pishrink.sh are installed.",
+                "Shrink is not ready. Use the Shrink Readiness section to re-check whether WSL and PiShrink are installed.",
             )
             self._log("Shrink blocked because WSL PiShrink was not available.")
             return
@@ -821,6 +1263,7 @@ class MainWindow(QMainWindow):
         self.shrink_final_stage_logged = False
         self.progress_bar.setValue(self.shrink_progress_value)
         self._refresh_queue()
+        self._refresh_action_button_states()
         self._set_last_result(
             status="Shrink running...",
             original_size=format_bytes(source_size),
@@ -849,10 +1292,12 @@ class MainWindow(QMainWindow):
             completed_name = self.active_operation or "operation"
             self._refresh_queue()
             self.progress_bar.setValue(100)
+
             self._set_status(f"Completed '{completed_name}' in mock backend.")
             self._log(f"Completed mock '{completed_name}' operation.")
             self._record_recent_job("Completed", completed_name)
             self._clear_active_operation_state()
+            self._refresh_action_button_states()
             return
 
         self.controller.apply_progress(self.progress_value)
@@ -918,9 +1363,7 @@ class MainWindow(QMainWindow):
                         self.vault_path,
                         output_path.name,
                         is_shrunk=True,
-                        original_filename=Path(self.active_context.image_path).name
-                        if self.active_context
-                        else output_path.name,
+                        original_filename=Path(self.active_context.image_path).name if self.active_context else output_path.name,
                     )
 
                     self._log(f"Shrunk image size: {output_size_text}")
@@ -941,9 +1384,7 @@ class MainWindow(QMainWindow):
 
             self._set_last_result(
                 status=status_text,
-                original_size=format_bytes(self.active_shrink_source_size)
-                if self.active_shrink_source_size is not None
-                else "-",
+                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
                 output_size=output_size_text,
                 saved=saved_text,
                 output_path=output_path_text,
@@ -961,16 +1402,13 @@ class MainWindow(QMainWindow):
             self._record_recent_job("Completed", completed_name)
             if plan is not None:
                 self._refresh_vault(select_path=Path(plan.output_path_windows))
-                self.image_path_edit.setText(plan.output_path_windows)
         else:
             self.controller.fail_operation()
             self._refresh_queue()
             self._set_status("Shrink failed.")
             self._set_last_result(
                 status="Shrink failed.",
-                original_size=format_bytes(self.active_shrink_source_size)
-                if self.active_shrink_source_size is not None
-                else "-",
+                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
                 output_path=plan.output_path_windows if plan is not None else "-",
             )
             self._log(f"WSL shrink failed with return code {returncode}.")
@@ -988,8 +1426,15 @@ class MainWindow(QMainWindow):
             )
 
         self._clear_active_operation_state()
+        self._refresh_action_button_states()
 
     def _cancel_operation(self) -> None:
+        if self.active_copy_output_path is not None and self.active_operation == "save":
+            self.copy_cancel_requested = True
+            self._set_status("Cancelling 'save'...")
+            self._log("Cancellation requested for real save operation.")
+            return
+
         if self.timer.isActive():
             self.timer.stop()
             failed_name = self.active_operation or "operation"
@@ -1000,6 +1445,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(0)
             self._record_recent_job("Cancelled", failed_name)
             self._clear_active_operation_state()
+            self._refresh_action_button_states()
             return
 
         if self.shrink_poll_timer.isActive() and self.active_shrink_process is not None:
@@ -1014,17 +1460,14 @@ class MainWindow(QMainWindow):
                 self.active_shrink_process.kill()
                 stdout, stderr = self.active_shrink_process.communicate()
 
+            self._remove_incomplete_shrink_output(log_prefix="Shrink cancellation")
             self.controller.fail_operation()
             self._refresh_queue()
             self._set_status(f"Cancelled '{failed_name}'.")
             self._set_last_result(
                 status="Shrink cancelled." if failed_name == "shrink" else f"{failed_name} cancelled.",
-                original_size=format_bytes(self.active_shrink_source_size)
-                if self.active_shrink_source_size is not None
-                else "-",
-                output_path=self.active_shrink_plan.output_path_windows
-                if self.active_shrink_plan is not None
-                else "-",
+                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
+                output_path=self.active_shrink_plan.output_path_windows if self.active_shrink_plan is not None else "-",
             )
             self._log(f"Cancelled real WSL shrink operation: {failed_name}")
             if stdout.strip():
@@ -1035,11 +1478,60 @@ class MainWindow(QMainWindow):
                 self._log(stderr.strip())
             self.progress_bar.setValue(0)
             self._record_recent_job("Cancelled", failed_name)
+            self._refresh_vault()
             self._clear_active_operation_state()
+            self._refresh_action_button_states()
             return
 
         self._log("Cancel requested, but no operation was active.")
         self._set_status("No active operation to cancel.")
+
+    def _cancel_operation_for_close(self) -> None:
+        if self.active_shrink_process is not None:
+            failed_name = self.active_operation or "shrink"
+            self._log("Closing app: cancelling active WSL shrink process.")
+            self.shrink_poll_timer.stop()
+            self.active_shrink_process.terminate()
+
+            try:
+                stdout, stderr = self.active_shrink_process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.active_shrink_process.kill()
+                stdout, stderr = self.active_shrink_process.communicate()
+
+            self._remove_incomplete_shrink_output(log_prefix="App close cancellation")
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self._set_status(f"Cancelled '{failed_name}' due to app close.")
+            self._set_last_result(
+                status="Shrink cancelled due to app close.",
+                original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
+                output_path=self.active_shrink_plan.output_path_windows if self.active_shrink_plan is not None else "-",
+            )
+            if stdout.strip():
+                self._log("Process output before close:")
+                self._log(stdout.strip())
+            if stderr.strip():
+                self._log("Process errors before close:")
+                self._log(stderr.strip())
+            self.progress_bar.setValue(0)
+            self._record_recent_job("Cancelled", failed_name)
+            self._clear_active_operation_state()
+            self._refresh_action_button_states()
+            return
+
+        if self.active_operation is not None or self.timer.isActive():
+            failed_name = self.active_operation or "operation"
+            self._log(f"Closing app: cancelling active '{failed_name}' operation.")
+            self.timer.stop()
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self._set_status(f"Cancelled '{failed_name}' due to app close.")
+            self.progress_bar.setValue(0)
+            self._record_recent_job("Cancelled", failed_name)
+            self._clear_active_operation_state()
+            self._refresh_action_button_states()
+            return
 
     def _record_recent_job(self, status: str, operation_name: str) -> None:
         if self.active_context is None:
