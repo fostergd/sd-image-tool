@@ -109,3 +109,47 @@ def copy_physical_drive_to_image(
                 progress_callback(bytes_copied, total_size)
 
     return bytes_copied
+
+
+def copy_image_to_physical_drive(
+    image_path: Path,
+    device_id: str,
+    *,
+    chunk_size: int = 8 * 1024 * 1024,
+    progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
+) -> int:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero")
+
+    if not image_path.exists() or not image_path.is_file():
+        raise RuntimeError("The selected image file does not exist or is not a normal file.")
+
+    total_size = image_path.stat().st_size
+    if total_size <= 0:
+        raise RuntimeError("The selected image file is empty.")
+
+    device_size = get_physical_drive_size_bytes(device_id)
+    if device_size is None:
+        raise RuntimeError("Could not determine the size of the selected device.")
+
+    if total_size > device_size:
+        raise RuntimeError("The selected image is larger than the target device.")
+
+    bytes_written = 0
+    with image_path.open("rb") as source_handle, open(device_id, "wb", buffering=0) as target_handle:
+        while True:
+            if cancel_callback is not None and cancel_callback():
+                raise CopyCancelledError("Copy cancelled.")
+
+            chunk = source_handle.read(chunk_size)
+            if not chunk:
+                break
+
+            target_handle.write(chunk)
+            bytes_written += len(chunk)
+
+            if progress_callback is not None:
+                progress_callback(bytes_written, total_size)
+
+    return bytes_written
