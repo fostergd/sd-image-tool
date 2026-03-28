@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 import subprocess
+from queue import Empty, Queue
 from shutil import copystat, disk_usage
+import threading
+import time
 
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtWidgets import (
@@ -78,6 +81,11 @@ class MainWindow(QMainWindow):
         self.shrink_progress_value = 0
         self.shrink_final_stage_logged = False
         self.delete_source_after_successful_shrink: Path | None = None
+
+        self.shrink_output_queue: Queue[str] | None = None
+        self.shrink_output_thread: threading.Thread | None = None
+        self.shrink_last_output_monotonic = 0.0
+        self.shrink_last_stall_notice_monotonic = 0.0
 
         self.copy_cancel_requested = False
         self.active_copy_output_path: Path | None = None
@@ -236,7 +244,7 @@ class MainWindow(QMainWindow):
         self.vault_list.setSpacing(2)
         layout.addWidget(self.vault_list, 1)
 
-        self.vault_summary_label = QLabel("No images found in vault.")
+        self.vault_summary_label = QLabel("No images found in the app vault.")
         self.vault_summary_label.setWordWrap(True)
         layout.addWidget(self.vault_summary_label, 0)
 
@@ -462,6 +470,60 @@ class MainWindow(QMainWindow):
 
         self._cancel_operation_for_close()
         event.accept()
+
+    def _start_shrink_output_reader(self) -> None:
+        process = self.active_shrink_process
+        if process is None or process.stdout is None:
+            self.shrink_output_queue = None
+            self.shrink_output_thread = None
+            return
+
+        self.shrink_output_queue = Queue()
+
+        def reader() -> None:
+            assert process.stdout is not None
+            try:
+                for raw_line in process.stdout:
+                    line = raw_line.rstrip()
+                    if line:
+                        self.shrink_output_queue.put(line)
+            finally:
+                try:
+                    process.stdout.close()
+                except Exception:
+                    pass
+
+        self.shrink_output_thread = threading.Thread(target=reader, daemon=True)
+        self.shrink_output_thread.start()
+        self.shrink_last_output_monotonic = time.monotonic()
+        self.shrink_last_stall_notice_monotonic = 0.0
+
+    def _drain_shrink_output_queue(self) -> None:
+        if self.shrink_output_queue is None:
+            return
+
+        while True:
+            try:
+                line = self.shrink_output_queue.get_nowait()
+            except Empty:
+                break
+
+            self.shrink_last_output_monotonic = time.monotonic()
+            self._log(f"PiShrink: {line}")
+
+    def _finalize_shrink_output_reader(self) -> None:
+        self._drain_shrink_output_queue()
+        if self.shrink_output_thread is not None:
+            self.shrink_output_thread.join(timeout=0.5)
+        self._drain_shrink_output_queue()
+
+    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     def _set_last_result(
         self,
@@ -1277,6 +1339,7 @@ class MainWindow(QMainWindow):
         self._set_status("Starting WSL shrink. This may take a while for large images...")
 
         self.active_shrink_process = start_pishrink_process(plan)
+        self._start_shrink_output_reader()
         self.controller.set_running_step(2)
         self.shrink_progress_value = 30
         self.progress_bar.setValue(self.shrink_progress_value)
@@ -1310,12 +1373,24 @@ class MainWindow(QMainWindow):
             self.shrink_poll_timer.stop()
             return
 
+        self._drain_shrink_output_queue()
         returncode = self.active_shrink_process.poll()
+
         if returncode is None:
             self.shrink_progress_value = min(90, self.shrink_progress_value + 3)
             self.controller.set_running_step(2)
             self.progress_bar.setValue(self.shrink_progress_value)
             self._refresh_queue()
+
+            now = time.monotonic()
+            if (
+                self.shrink_progress_value >= 90
+                and self.shrink_last_output_monotonic > 0
+                and (now - self.shrink_last_output_monotonic) >= 120
+                and (now - self.shrink_last_stall_notice_monotonic) >= 120
+            ):
+                self._log("PiShrink has produced no new output for at least 2 minutes, but the process is still running.")
+                self.shrink_last_stall_notice_monotonic = now
 
             if self.shrink_progress_value >= 90:
                 self._set_status("Finishing shrink and truncating image... this can sit near 90% for a while.")
@@ -1332,7 +1407,7 @@ class MainWindow(QMainWindow):
             return
 
         self.shrink_poll_timer.stop()
-        stdout, stderr = self.active_shrink_process.communicate()
+        self._finalize_shrink_output_reader()
         plan = self.active_shrink_plan
         completed_name = self.active_operation or "shrink"
 
@@ -1396,13 +1471,11 @@ class MainWindow(QMainWindow):
                 self._log(f"Shrink output image: {plan.output_path_windows}")
             if saved_text != "-":
                 self._log(saved_text)
-            if stdout.strip():
-                self._log("PiShrink output:")
-                self._log(stdout.strip())
             self._record_recent_job("Completed", completed_name)
             if plan is not None:
                 self._refresh_vault(select_path=Path(plan.output_path_windows))
         else:
+            self._remove_incomplete_shrink_output(log_prefix="Shrink failure")
             self.controller.fail_operation()
             self._refresh_queue()
             self._set_status("Shrink failed.")
@@ -1412,13 +1485,8 @@ class MainWindow(QMainWindow):
                 output_path=plan.output_path_windows if plan is not None else "-",
             )
             self._log(f"WSL shrink failed with return code {returncode}.")
-            if stderr.strip():
-                self._log("PiShrink error output:")
-                self._log(stderr.strip())
-            if stdout.strip():
-                self._log("PiShrink standard output:")
-                self._log(stdout.strip())
             self._record_recent_job("Failed", completed_name)
+            self._refresh_vault()
             QMessageBox.critical(
                 self,
                 "Shrink failed",
@@ -1452,13 +1520,8 @@ class MainWindow(QMainWindow):
             self.shrink_poll_timer.stop()
             failed_name = self.active_operation or "shrink"
             self._log("Cancellation requested for WSL shrink process.")
-            self.active_shrink_process.terminate()
-
-            try:
-                stdout, stderr = self.active_shrink_process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.active_shrink_process.kill()
-                stdout, stderr = self.active_shrink_process.communicate()
+            self._terminate_process(self.active_shrink_process)
+            self._finalize_shrink_output_reader()
 
             self._remove_incomplete_shrink_output(log_prefix="Shrink cancellation")
             self.controller.fail_operation()
@@ -1470,12 +1533,6 @@ class MainWindow(QMainWindow):
                 output_path=self.active_shrink_plan.output_path_windows if self.active_shrink_plan is not None else "-",
             )
             self._log(f"Cancelled real WSL shrink operation: {failed_name}")
-            if stdout.strip():
-                self._log("Process output before cancellation:")
-                self._log(stdout.strip())
-            if stderr.strip():
-                self._log("Process errors before cancellation:")
-                self._log(stderr.strip())
             self.progress_bar.setValue(0)
             self._record_recent_job("Cancelled", failed_name)
             self._refresh_vault()
@@ -1491,13 +1548,8 @@ class MainWindow(QMainWindow):
             failed_name = self.active_operation or "shrink"
             self._log("Closing app: cancelling active WSL shrink process.")
             self.shrink_poll_timer.stop()
-            self.active_shrink_process.terminate()
-
-            try:
-                stdout, stderr = self.active_shrink_process.communicate(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.active_shrink_process.kill()
-                stdout, stderr = self.active_shrink_process.communicate()
+            self._terminate_process(self.active_shrink_process)
+            self._finalize_shrink_output_reader()
 
             self._remove_incomplete_shrink_output(log_prefix="App close cancellation")
             self.controller.fail_operation()
@@ -1508,12 +1560,6 @@ class MainWindow(QMainWindow):
                 original_size=format_bytes(self.active_shrink_source_size) if self.active_shrink_source_size is not None else "-",
                 output_path=self.active_shrink_plan.output_path_windows if self.active_shrink_plan is not None else "-",
             )
-            if stdout.strip():
-                self._log("Process output before close:")
-                self._log(stdout.strip())
-            if stderr.strip():
-                self._log("Process errors before close:")
-                self._log(stderr.strip())
             self.progress_bar.setValue(0)
             self._record_recent_job("Cancelled", failed_name)
             self._clear_active_operation_state()
@@ -1578,6 +1624,10 @@ class MainWindow(QMainWindow):
         self.shrink_progress_value = 0
         self.shrink_final_stage_logged = False
         self.delete_source_after_successful_shrink = None
+        self.shrink_output_queue = None
+        self.shrink_output_thread = None
+        self.shrink_last_output_monotonic = 0.0
+        self.shrink_last_stall_notice_monotonic = 0.0
 
     def _refresh_queue(self) -> None:
         icons = {
