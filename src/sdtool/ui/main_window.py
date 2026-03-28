@@ -244,7 +244,7 @@ class MainWindow(QMainWindow):
         self.vault_list.setSpacing(2)
         layout.addWidget(self.vault_list, 1)
 
-        self.vault_summary_label = QLabel("No images found in the app vault.")
+        self.vault_summary_label = QLabel("No images found in vault.")
         self.vault_summary_label.setWordWrap(True)
         layout.addWidget(self.vault_summary_label, 0)
 
