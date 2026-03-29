@@ -8,6 +8,7 @@ import sdtool.windows_raw as windows_raw
 from sdtool.windows_raw import (
     CopyCancelledError,
     _extract_disk_number,
+    compare_image_to_physical_drive,
     copy_image_to_physical_drive,
     copy_physical_drive_to_image,
 )
@@ -132,3 +133,59 @@ def test_copy_image_to_physical_drive_can_cancel(tmp_path: Path, monkeypatch) ->
         )
 
     assert fake_device.read_bytes()[:4] == b"abcd"
+
+
+def test_compare_image_to_physical_drive_succeeds(tmp_path: Path, monkeypatch) -> None:
+    image_path = tmp_path / "input.img"
+    image_path.write_bytes(b"abcdefghij")
+    fake_device = tmp_path / "fake-device.bin"
+    fake_device.write_bytes(b"abcdefghij")
+
+    monkeypatch.setattr(windows_raw, "get_physical_drive_size_bytes", lambda device_id: 10)
+
+    progress_calls: list[tuple[int, int]] = []
+
+    bytes_verified = compare_image_to_physical_drive(
+        image_path,
+        str(fake_device),
+        chunk_size=4,
+        progress_callback=lambda done, total: progress_calls.append((done, total)),
+    )
+
+    assert bytes_verified == 10
+    assert progress_calls[-1] == (10, 10)
+
+
+def test_compare_image_to_physical_drive_detects_mismatch(tmp_path: Path, monkeypatch) -> None:
+    image_path = tmp_path / "input.img"
+    image_path.write_bytes(b"abcdefghij")
+    fake_device = tmp_path / "fake-device.bin"
+    fake_device.write_bytes(b"abcdXfghij")
+
+    monkeypatch.setattr(windows_raw, "get_physical_drive_size_bytes", lambda device_id: 10)
+
+    with pytest.raises(RuntimeError, match="differ at byte offset 4"):
+        compare_image_to_physical_drive(image_path, str(fake_device), chunk_size=4)
+
+
+def test_compare_image_to_physical_drive_can_cancel(tmp_path: Path, monkeypatch) -> None:
+    image_path = tmp_path / "input.img"
+    image_path.write_bytes(b"abcdefghij")
+    fake_device = tmp_path / "fake-device.bin"
+    fake_device.write_bytes(b"abcdefghij")
+
+    monkeypatch.setattr(windows_raw, "get_physical_drive_size_bytes", lambda device_id: 10)
+
+    calls = {"count": 0}
+
+    def cancel_callback() -> bool:
+        calls["count"] += 1
+        return calls["count"] > 1
+
+    with pytest.raises(CopyCancelledError):
+        compare_image_to_physical_drive(
+            image_path,
+            str(fake_device),
+            chunk_size=4,
+            cancel_callback=cancel_callback,
+        )

@@ -4,6 +4,7 @@ import ctypes
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -78,6 +79,19 @@ if sys.platform == "win32":
     ]
     _SetFilePointerEx.restype = wintypes.BOOL
 
+    _DeviceIoControl = _kernel32.DeviceIoControl
+    _DeviceIoControl.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    _DeviceIoControl.restype = wintypes.BOOL
+
     GENERIC_READ = 0x80000000
     GENERIC_WRITE = 0x40000000
     FILE_SHARE_READ = 0x00000001
@@ -85,6 +99,10 @@ if sys.platform == "win32":
     OPEN_EXISTING = 3
     FILE_ATTRIBUTE_NORMAL = 0x00000080
     FILE_BEGIN = 0
+
+    FSCTL_LOCK_VOLUME = 0x00090018
+    FSCTL_UNLOCK_VOLUME = 0x0009001C
+    FSCTL_DISMOUNT_VOLUME = 0x00090020
 
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 else:
@@ -112,11 +130,42 @@ def _open_windows_physical_drive_for_write(device_id: str):
     return handle
 
 
+def _open_windows_volume_for_direct_access(volume_path: str):
+    handle = _CreateFileW(
+        volume_path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        _raise_last_windows_error(f"Could not open mounted volume {volume_path}")
+    return handle
+
+
 def _seek_windows_handle_to_start(handle) -> None:
     new_pos = ctypes.c_longlong(0)
     ok = _SetFilePointerEx(handle, 0, ctypes.byref(new_pos), FILE_BEGIN)
     if not ok:
         _raise_last_windows_error("Could not seek target device to offset 0")
+
+
+def _device_io_control_no_buffer(handle, control_code: int, prefix: str) -> None:
+    bytes_returned = wintypes.DWORD(0)
+    ok = _DeviceIoControl(
+        handle,
+        control_code,
+        None,
+        0,
+        None,
+        0,
+        ctypes.byref(bytes_returned),
+        None,
+    )
+    if not ok:
+        _raise_last_windows_error(prefix)
 
 
 def _write_chunk_to_windows_handle(handle, chunk: bytes) -> None:
@@ -148,6 +197,95 @@ def _write_chunk_to_windows_handle(handle, chunk: bytes) -> None:
         offset += written.value
 
 
+def _get_disk_drive_letters(device_id: str) -> list[str]:
+    disk_number = _extract_disk_number(device_id)
+    if disk_number is None or sys.platform != "win32":
+        return []
+
+    command = [
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        (
+            f"Get-Partition -DiskNumber {disk_number} -ErrorAction SilentlyContinue | "
+            "Where-Object DriveLetter | "
+            "Select-Object -ExpandProperty DriveLetter"
+        ),
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (FileNotFoundError, OSError):
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    letters: list[str] = []
+    for line in result.stdout.splitlines():
+        letter = line.strip().upper().rstrip(":")
+        if len(letter) == 1 and letter.isalpha() and letter not in letters:
+            letters.append(letter)
+
+    return letters
+
+
+@contextmanager
+def _locked_dismounted_windows_volumes_for_disk(device_id: str):
+    handles: list[tuple[object, str]] = []
+
+    if not _is_windows_physical_drive(device_id):
+        yield
+        return
+
+    drive_letters = _get_disk_drive_letters(device_id)
+
+    try:
+        for letter in drive_letters:
+            volume_path = rf"\\.\{letter}:"
+            handle = _open_windows_volume_for_direct_access(volume_path)
+            try:
+                _device_io_control_no_buffer(
+                    handle,
+                    FSCTL_LOCK_VOLUME,
+                    (
+                        f"Could not lock mounted volume {volume_path}. "
+                        "Close any Explorer windows or apps using the SD card and try again"
+                    ),
+                )
+                _device_io_control_no_buffer(
+                    handle,
+                    FSCTL_DISMOUNT_VOLUME,
+                    f"Could not dismount mounted volume {volume_path}",
+                )
+            except Exception:
+                _CloseHandle(handle)
+                raise
+
+            handles.append((handle, volume_path))
+
+        yield
+    finally:
+        for handle, volume_path in reversed(handles):
+            try:
+                _device_io_control_no_buffer(
+                    handle,
+                    FSCTL_UNLOCK_VOLUME,
+                    f"Could not unlock mounted volume {volume_path}",
+                )
+            except Exception:
+                pass
+            _CloseHandle(handle)
+
+
 def _copy_image_to_windows_physical_drive(
     image_path: Path,
     device_id: str,
@@ -158,27 +296,29 @@ def _copy_image_to_windows_physical_drive(
 ) -> int:
     total_size = image_path.stat().st_size
     bytes_written = 0
-    handle = _open_windows_physical_drive_for_write(device_id)
 
-    try:
-        _seek_windows_handle_to_start(handle)
+    with _locked_dismounted_windows_volumes_for_disk(device_id):
+        handle = _open_windows_physical_drive_for_write(device_id)
 
-        with image_path.open("rb") as source_handle:
-            while True:
-                if cancel_callback is not None and cancel_callback():
-                    raise CopyCancelledError("Copy cancelled.")
+        try:
+            _seek_windows_handle_to_start(handle)
 
-                chunk = source_handle.read(chunk_size)
-                if not chunk:
-                    break
+            with image_path.open("rb") as source_handle:
+                while True:
+                    if cancel_callback is not None and cancel_callback():
+                        raise CopyCancelledError("Copy cancelled.")
 
-                _write_chunk_to_windows_handle(handle, chunk)
-                bytes_written += len(chunk)
+                    chunk = source_handle.read(chunk_size)
+                    if not chunk:
+                        break
 
-                if progress_callback is not None:
-                    progress_callback(bytes_written, total_size)
-    finally:
-        _CloseHandle(handle)
+                    _write_chunk_to_windows_handle(handle, chunk)
+                    bytes_written += len(chunk)
+
+                    if progress_callback is not None:
+                        progress_callback(bytes_written, total_size)
+        finally:
+            _CloseHandle(handle)
 
     return bytes_written
 
@@ -312,3 +452,61 @@ def copy_image_to_physical_drive(
                 progress_callback(bytes_written, total_size)
 
     return bytes_written
+
+
+def compare_image_to_physical_drive(
+    image_path: Path,
+    device_id: str,
+    *,
+    chunk_size: int = 8 * 1024 * 1024,
+    progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
+) -> int:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero")
+
+    if not image_path.exists() or not image_path.is_file():
+        raise RuntimeError("The selected image file does not exist or is not a normal file.")
+
+    total_size = image_path.stat().st_size
+    if total_size <= 0:
+        raise RuntimeError("The selected image file is empty.")
+
+    device_size = get_physical_drive_size_bytes(device_id)
+    if device_size is None:
+        raise RuntimeError("Could not determine the size of the selected device.")
+
+    if total_size > device_size:
+        raise RuntimeError("The selected image is larger than the target device.")
+
+    bytes_verified = 0
+    with image_path.open("rb") as image_handle, open(device_id, "rb", buffering=0) as device_handle:
+        while bytes_verified < total_size:
+            if cancel_callback is not None and cancel_callback():
+                raise CopyCancelledError("Copy cancelled.")
+
+            bytes_remaining = total_size - bytes_verified
+            bytes_to_read = min(chunk_size, bytes_remaining)
+
+            image_chunk = image_handle.read(bytes_to_read)
+            if not image_chunk:
+                break
+
+            device_chunk = device_handle.read(len(image_chunk))
+            if len(device_chunk) != len(image_chunk):
+                raise OSError("Unexpected end of device while reading raw data for verification.")
+
+            if image_chunk != device_chunk:
+                for index, (image_byte, device_byte) in enumerate(zip(image_chunk, device_chunk)):
+                    if image_byte != device_byte:
+                        raise RuntimeError(
+                            f"Verification failed: image and target device differ at byte offset {bytes_verified + index}."
+                        )
+                raise RuntimeError("Verification failed: image and target device differ.")
+
+            bytes_verified += len(image_chunk)
+
+            if progress_callback is not None:
+                progress_callback(bytes_verified, total_size)
+
+    return bytes_verified

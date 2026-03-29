@@ -41,7 +41,13 @@ from sdtool.image_vault import (
     record_import_metadata,
     scan_vault,
 )
-from sdtool.windows_raw import CopyCancelledError, copy_physical_drive_to_image, get_physical_drive_size_bytes
+from sdtool.windows_raw import (
+    CopyCancelledError,
+    compare_image_to_physical_drive,
+    copy_image_to_physical_drive,
+    copy_physical_drive_to_image,
+    get_physical_drive_size_bytes,
+)
 from sdtool.workflow import StepStatus, WorkflowController
 from sdtool.wsl_shrink import (
     WslCommandPlan,
@@ -88,7 +94,9 @@ class MainWindow(QMainWindow):
         self.shrink_last_stall_notice_monotonic = 0.0
 
         self.copy_cancel_requested = False
+        self.active_copy_mode: str | None = None
         self.active_copy_output_path: Path | None = None
+        self.active_copy_target_device_id: str | None = None
 
         self.vault_path = default_vault_path()
         self.vault_images: list[VaultImage] = []
@@ -103,9 +111,9 @@ class MainWindow(QMainWindow):
         self._refresh_shrink_readiness(log_result=False)
         self._set_disk_selector_mode("generic")
         self._refresh_action_button_states()
-        self._log("Real save is enabled. Write and Verify remain mocked. Shrink can run in real WSL mode.")
+        self._log("Real save, write, and verify are enabled. Shrink can run in real WSL mode.")
         self._log(f"Image vault folder: {self.vault_path}")
-        self._set_status("Ready. Real save enabled. Write/Verify mocked.")
+        self._set_status("Ready. Real save/write/verify enabled.")
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -117,7 +125,9 @@ class MainWindow(QMainWindow):
 
         top_notice = QLabel(
             "Save reads the selected SD card into an image file. "
-            "Write and Verify are still mocked. Shrink can run through WSL PiShrink."
+            "Write writes the selected image to the selected SD card. "
+            "Verify compares the selected image against the selected SD card. "
+            "Shrink can run through WSL PiShrink."
         )
         top_notice.setWordWrap(True)
         root.addWidget(top_notice)
@@ -244,7 +254,7 @@ class MainWindow(QMainWindow):
         self.vault_list.setSpacing(2)
         layout.addWidget(self.vault_list, 1)
 
-        self.vault_summary_label = QLabel("No images found in vault.")
+        self.vault_summary_label = QLabel("No images found in the app vault.")
         self.vault_summary_label.setWordWrap(True)
         layout.addWidget(self.vault_summary_label, 0)
 
@@ -435,11 +445,11 @@ class MainWindow(QMainWindow):
         return footer
 
     def closeEvent(self, event) -> None:
-        if self.active_copy_output_path is not None and self.active_operation == "save":
+        if self.active_copy_mode in {"save", "write", "verify"}:
             reply = QMessageBox.question(
                 self,
                 "Operation in progress",
-                "A save is still running.\n\nCancel it first?",
+                f"A {self.active_copy_mode} is still running.\n\nCancel it first?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -448,8 +458,8 @@ class MainWindow(QMainWindow):
                 return
 
             self.copy_cancel_requested = True
-            self._set_status("Cancelling 'save' before close...")
-            self._log("Close requested during real save. Cancellation requested.")
+            self._set_status(f"Cancelling '{self.active_copy_mode}' before close...")
+            self._log(f"Close requested during real {self.active_copy_mode}. Cancellation requested.")
             event.ignore()
             return
 
@@ -625,7 +635,7 @@ class MainWindow(QMainWindow):
             self.selected_image_value.setText(str(selected_path))
 
     def _refresh_action_button_states(self) -> None:
-        operation_running = self._operation_is_running() or self.active_copy_output_path is not None
+        operation_running = self._operation_is_running() or self.active_copy_mode is not None
         selected_image_path = self._selected_vault_image_path()
         selected_disk_present = self.disk_combo.currentData() is not None
         has_real_image = selected_image_path is not None and not self._is_mock_placeholder_image(selected_image_path)
@@ -1006,6 +1016,7 @@ class MainWindow(QMainWindow):
             self,
             "Confirm write",
             "Write the selected image to the selected SD card?\n\n"
+            "This will overwrite the target device.\n\n"
             f"Image: {selected_image_path.name}\n"
             f"Target: {self._selected_disk_label()}",
             QMessageBox.Yes | QMessageBox.No,
@@ -1023,10 +1034,35 @@ class MainWindow(QMainWindow):
 
     def _start_verify_operation(self) -> None:
         self._set_disk_selector_mode("verify")
+
+        selected_disk_id = self.disk_combo.currentData()
+        selected_image_path = self._selected_vault_image_path()
+
+        if selected_disk_id is None or selected_image_path is None:
+            self._start_operation("verify")
+            return
+
+        if self._is_mock_placeholder_image(selected_image_path):
+            self._show_mock_placeholder_blocked_message("verify", selected_image_path)
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm verify",
+            "Compare the selected image against the selected SD card?\n\n"
+            f"Image: {selected_image_path.name}\n"
+            f"Target: {self._selected_disk_label()}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("Verify operation cancelled at confirmation dialog.")
+            return
+
         self._start_operation("verify")
 
     def _start_operation(self, operation_name: str, *, image_path_override: str | None = None) -> None:
-        if self.timer.isActive() or self.shrink_poll_timer.isActive() or self.active_copy_output_path is not None:
+        if self.timer.isActive() or self.shrink_poll_timer.isActive() or self.active_copy_mode is not None:
             QMessageBox.information(
                 self,
                 "Operation already running",
@@ -1081,6 +1117,14 @@ class MainWindow(QMainWindow):
 
         if operation_name == "save":
             self._start_real_save_operation(context)
+            return
+
+        if operation_name == "write":
+            self._start_real_write_operation(context)
+            return
+
+        if operation_name == "verify":
+            self._start_real_verify_operation(context)
             return
 
         if operation_name == "shrink":
@@ -1144,6 +1188,30 @@ class MainWindow(QMainWindow):
         )
         QApplication.processEvents()
 
+    def _on_real_write_progress(self, bytes_written: int, total_size: int) -> None:
+        percent = 0
+        if total_size > 0:
+            percent = min(98, int((bytes_written / total_size) * 100))
+
+        self.progress_bar.setValue(percent)
+        self._set_status(
+            f"Writing image to SD card... {percent}% "
+            f"({format_bytes(bytes_written)} of {format_bytes(total_size)})"
+        )
+        QApplication.processEvents()
+
+    def _on_real_verify_progress(self, bytes_verified: int, total_size: int) -> None:
+        percent = 0
+        if total_size > 0:
+            percent = min(98, int((bytes_verified / total_size) * 100))
+
+        self.progress_bar.setValue(percent)
+        self._set_status(
+            f"Verifying image against SD card... {percent}% "
+            f"({format_bytes(bytes_verified)} of {format_bytes(total_size)})"
+        )
+        QApplication.processEvents()
+
     def _start_real_save_operation(self, context: OperationContext) -> None:
         output_path = Path(context.image_path)
         auto_shrink_output_path: Path | None = None
@@ -1169,7 +1237,9 @@ class MainWindow(QMainWindow):
         self.active_source_label = self._selected_disk_label()
         self.active_target_label = ""
         self.copy_cancel_requested = False
+        self.active_copy_mode = "save"
         self.active_copy_output_path = output_path
+        self.active_copy_target_device_id = None
         self.progress_bar.setValue(0)
         self._refresh_queue()
         self._refresh_action_button_states()
@@ -1258,14 +1328,200 @@ class MainWindow(QMainWindow):
             )
         finally:
             self.copy_cancel_requested = False
-            self.active_copy_output_path = None
             self._clear_active_operation_state()
             self._refresh_action_button_states()
 
         if auto_shrink_output_path is not None and auto_shrink_output_path.exists():
+            self.delete_source_after_successful_shrink = auto_shrink_output_path
             self._refresh_vault(select_path=auto_shrink_output_path)
             self._set_disk_selector_mode("shrink")
             self._start_operation("shrink")
+
+    def _start_real_write_operation(self, context: OperationContext) -> None:
+        image_path = Path(context.image_path)
+        target_device_id = context.target_device_id or ""
+
+        try:
+            image_size = image_path.stat().st_size
+            if image_size <= 0:
+                raise RuntimeError("The selected image file is empty.")
+
+            target_size = get_physical_drive_size_bytes(target_device_id)
+            if target_size is None:
+                raise RuntimeError(
+                    "Could not determine the size of the selected target device. "
+                    "Run the app as Administrator and try again."
+                )
+
+            if image_size > target_size:
+                raise RuntimeError("The selected image is larger than the target device.")
+
+            step_definitions = self.backend.get_operation_steps("write")
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot start write", str(exc))
+            self._log(f"Write preparation failed: {exc}")
+            return
+
+        self.controller.start_operation("write", step_definitions)
+        self.controller.set_running_step(1)
+        self.active_operation = "write"
+        self.active_context = context
+        self.active_source_label = ""
+        self.active_target_label = self._selected_disk_label()
+        self.copy_cancel_requested = False
+        self.active_copy_mode = "write"
+        self.active_copy_output_path = None
+        self.active_copy_target_device_id = target_device_id
+        self.progress_bar.setValue(0)
+        self._refresh_queue()
+        self._refresh_action_button_states()
+
+        self._log(f"Prepared real write to: {target_device_id}")
+        self._log(f"Selected target device: {self.active_target_label}")
+        self._log(f"Write source image: {image_path}")
+        self._log(f"Image size: {format_bytes(image_size)}")
+        self._log(f"Target size: {format_bytes(target_size)}")
+        self._set_status("Starting image write to SD card...")
+
+        try:
+            self.controller.set_running_step(2)
+            self._refresh_queue()
+
+            bytes_written = copy_image_to_physical_drive(
+                image_path,
+                target_device_id,
+                progress_callback=self._on_real_write_progress,
+                cancel_callback=lambda: self.copy_cancel_requested,
+            )
+
+            self.controller.set_running_step(3)
+            self._refresh_queue()
+
+            if bytes_written != image_size:
+                raise RuntimeError("Write completed with an unexpected byte count.")
+
+            self.controller.complete_operation()
+            self.progress_bar.setValue(100)
+            self._refresh_queue()
+            self._set_status(f"Wrote image to SD card successfully. {format_bytes(bytes_written)}")
+            self._log(f"Completed real write operation to: {target_device_id}")
+            self._record_recent_job("Completed", "write")
+        except CopyCancelledError:
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self.progress_bar.setValue(0)
+            self._set_status("Cancelled 'write'. Target device may contain partial image data.")
+            self._log("Cancelled real write operation. Target device may contain partial image data.")
+            self._record_recent_job("Cancelled", "write")
+        except Exception as exc:
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self.progress_bar.setValue(0)
+            self._set_status("Write failed.")
+            self._log(f"Real write failed: {exc}")
+            self._record_recent_job("Failed", "write")
+            QMessageBox.critical(
+                self,
+                "Write failed",
+                f"Could not write the image to the selected SD card:\n{exc}",
+            )
+        finally:
+            self.copy_cancel_requested = False
+            self._clear_active_operation_state()
+            self._refresh_action_button_states()
+
+    def _start_real_verify_operation(self, context: OperationContext) -> None:
+        image_path = Path(context.image_path)
+        target_device_id = context.target_device_id or ""
+
+        try:
+            image_size = image_path.stat().st_size
+            if image_size <= 0:
+                raise RuntimeError("The selected image file is empty.")
+
+            target_size = get_physical_drive_size_bytes(target_device_id)
+            if target_size is None:
+                raise RuntimeError(
+                    "Could not determine the size of the selected target device. "
+                    "Run the app as Administrator and try again."
+                )
+
+            if image_size > target_size:
+                raise RuntimeError("The selected image is larger than the target device.")
+
+            step_definitions = self.backend.get_operation_steps("verify")
+        except Exception as exc:
+            QMessageBox.critical(self, "Cannot start verify", str(exc))
+            self._log(f"Verify preparation failed: {exc}")
+            return
+
+        self.controller.start_operation("verify", step_definitions)
+        self.controller.set_running_step(1)
+        self.active_operation = "verify"
+        self.active_context = context
+        self.active_source_label = ""
+        self.active_target_label = self._selected_disk_label()
+        self.copy_cancel_requested = False
+        self.active_copy_mode = "verify"
+        self.active_copy_output_path = None
+        self.active_copy_target_device_id = target_device_id
+        self.progress_bar.setValue(0)
+        self._refresh_queue()
+        self._refresh_action_button_states()
+
+        self._log(f"Prepared real verify against: {target_device_id}")
+        self._log(f"Selected target device: {self.active_target_label}")
+        self._log(f"Verify source image: {image_path}")
+        self._log(f"Image size to compare: {format_bytes(image_size)}")
+        self._log(f"Target size: {format_bytes(target_size)}")
+        self._set_status("Starting image verification against SD card...")
+
+        try:
+            self.controller.set_running_step(2)
+            self._refresh_queue()
+
+            bytes_verified = compare_image_to_physical_drive(
+                image_path,
+                target_device_id,
+                progress_callback=self._on_real_verify_progress,
+                cancel_callback=lambda: self.copy_cancel_requested,
+            )
+
+            self.controller.set_running_step(3)
+            self._refresh_queue()
+
+            if bytes_verified != image_size:
+                raise RuntimeError("Verify completed with an unexpected byte count.")
+
+            self.controller.complete_operation()
+            self.progress_bar.setValue(100)
+            self._refresh_queue()
+            self._set_status(f"Verified image against SD card successfully. {format_bytes(bytes_verified)}")
+            self._log(f"Completed real verify operation against: {target_device_id}")
+            self._record_recent_job("Completed", "verify")
+        except CopyCancelledError:
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self.progress_bar.setValue(0)
+            self._set_status("Cancelled 'verify'.")
+            self._log("Cancelled real verify operation.")
+            self._record_recent_job("Cancelled", "verify")
+        except Exception as exc:
+            self.controller.fail_operation()
+            self._refresh_queue()
+            self.progress_bar.setValue(0)
+            self._set_status("Verify failed.")
+            self._log(f"Real verify failed: {exc}")
+            self._record_recent_job("Failed", "verify")
+            QMessageBox.critical(
+                self,
+                "Verify failed",
+                f"The selected image does not match the selected SD card:\n{exc}",
+            )
+        finally:
+            self.copy_cancel_requested = False
+            self._clear_active_operation_state()
+            self._refresh_action_button_states()
 
     def _start_real_shrink_operation(self, context: OperationContext) -> None:
         self._refresh_shrink_readiness(log_result=True)
@@ -1452,10 +1708,10 @@ class MainWindow(QMainWindow):
                             if cleanup_source.resolve() != output_path.resolve():
                                 cleanup_source.unlink()
                                 self._log(
-                                    f"Removed temporary unshrunk import after successful shrink: {cleanup_source}"
+                                    f"Removed temporary unshrunk image after successful shrink: {cleanup_source}"
                                 )
                         except OSError as exc:
-                            self._log(f"Could not remove temporary unshrunk import: {exc}")
+                            self._log(f"Could not remove temporary unshrunk image: {exc}")
 
             self._set_last_result(
                 status=status_text,
@@ -1497,10 +1753,10 @@ class MainWindow(QMainWindow):
         self._refresh_action_button_states()
 
     def _cancel_operation(self) -> None:
-        if self.active_copy_output_path is not None and self.active_operation == "save":
+        if self.active_copy_mode in {"save", "write", "verify"}:
             self.copy_cancel_requested = True
-            self._set_status("Cancelling 'save'...")
-            self._log("Cancellation requested for real save operation.")
+            self._set_status(f"Cancelling '{self.active_copy_mode}'...")
+            self._log(f"Cancellation requested for real {self.active_copy_mode} operation.")
             return
 
         if self.timer.isActive():
@@ -1628,6 +1884,9 @@ class MainWindow(QMainWindow):
         self.shrink_output_thread = None
         self.shrink_last_output_monotonic = 0.0
         self.shrink_last_stall_notice_monotonic = 0.0
+        self.active_copy_mode = None
+        self.active_copy_output_path = None
+        self.active_copy_target_device_id = None
 
     def _refresh_queue(self) -> None:
         icons = {
