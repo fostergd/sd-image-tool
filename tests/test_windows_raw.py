@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -189,3 +190,81 @@ def test_compare_image_to_physical_drive_can_cancel(tmp_path: Path, monkeypatch)
             chunk_size=4,
             cancel_callback=cancel_callback,
         )
+
+
+def test_get_disk_drive_letters_parses_powershell_output(monkeypatch) -> None:
+    monkeypatch.setattr(windows_raw.sys, "platform", "win32")
+
+    def fake_run(command, capture_output, text, check, creationflags):
+        return SimpleNamespace(returncode=0, stdout="F\nG\nF\n", stderr="")
+
+    monkeypatch.setattr(windows_raw.subprocess, "run", fake_run)
+
+    letters = windows_raw._get_disk_drive_letters(r"\\.\PHYSICALDRIVE2")
+
+    assert letters == ["F", "G"]
+
+
+def test_locked_dismounted_windows_volumes_for_disk_locks_and_unlocks(monkeypatch) -> None:
+    monkeypatch.setattr(windows_raw, "_is_windows_physical_drive", lambda device_id: True)
+    monkeypatch.setattr(windows_raw, "_get_disk_drive_letters", lambda device_id: ["F", "G"])
+
+    opened: list[str] = []
+    closed: list[str] = []
+    io_calls: list[tuple[str, int]] = []
+
+    def fake_open(volume_path: str):
+        opened.append(volume_path)
+        return volume_path
+
+    def fake_ioctl(handle, code: int, prefix: str) -> None:
+        io_calls.append((handle, code))
+
+    monkeypatch.setattr(windows_raw, "_open_windows_volume_for_direct_access", fake_open)
+    monkeypatch.setattr(windows_raw, "_device_io_control_no_buffer", fake_ioctl)
+    monkeypatch.setattr(windows_raw, "_CloseHandle", lambda handle: closed.append(handle))
+
+    with windows_raw._locked_dismounted_windows_volumes_for_disk(r"\\.\PHYSICALDRIVE2"):
+        pass
+
+    assert opened == [r"\\.\F:", r"\\.\G:"]
+    assert io_calls == [
+        (r"\\.\F:", windows_raw.FSCTL_LOCK_VOLUME),
+        (r"\\.\F:", windows_raw.FSCTL_DISMOUNT_VOLUME),
+        (r"\\.\G:", windows_raw.FSCTL_LOCK_VOLUME),
+        (r"\\.\G:", windows_raw.FSCTL_DISMOUNT_VOLUME),
+        (r"\\.\G:", windows_raw.FSCTL_UNLOCK_VOLUME),
+        (r"\\.\F:", windows_raw.FSCTL_UNLOCK_VOLUME),
+    ]
+    assert closed == [r"\\.\G:", r"\\.\F:"]
+
+
+def test_copy_image_to_physical_drive_uses_windows_physical_drive_path(tmp_path: Path, monkeypatch) -> None:
+    image_path = tmp_path / "input.img"
+    image_path.write_bytes(b"1234567890")
+
+    monkeypatch.setattr(windows_raw, "get_physical_drive_size_bytes", lambda device_id: 10)
+    monkeypatch.setattr(windows_raw, "_is_windows_physical_drive", lambda device_id: True)
+
+    captured: dict[str, object] = {}
+
+    def fake_copy(
+        image_path_arg: Path,
+        device_id_arg: str,
+        *,
+        chunk_size: int,
+        progress_callback,
+        cancel_callback,
+    ) -> int:
+        captured["image_path"] = image_path_arg
+        captured["device_id"] = device_id_arg
+        captured["chunk_size"] = chunk_size
+        return 10
+
+    monkeypatch.setattr(windows_raw, "_copy_image_to_windows_physical_drive", fake_copy)
+
+    result = copy_image_to_physical_drive(image_path, r"\\.\PHYSICALDRIVE2")
+
+    assert result == 10
+    assert captured["image_path"] == image_path
+    assert captured["device_id"] == r"\\.\PHYSICALDRIVE2"

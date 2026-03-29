@@ -107,6 +107,17 @@ if sys.platform == "win32":
     INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 else:
     _kernel32 = None
+    GENERIC_READ = 0
+    GENERIC_WRITE = 0
+    FILE_SHARE_READ = 0
+    FILE_SHARE_WRITE = 0
+    OPEN_EXISTING = 0
+    FILE_ATTRIBUTE_NORMAL = 0
+    FILE_BEGIN = 0
+    FSCTL_LOCK_VOLUME = 0
+    FSCTL_UNLOCK_VOLUME = 0
+    FSCTL_DISMOUNT_VOLUME = 0
+    INVALID_HANDLE_VALUE = -1
 
 
 def _raise_last_windows_error(prefix: str) -> None:
@@ -153,6 +164,8 @@ def _seek_windows_handle_to_start(handle) -> None:
 
 
 def _device_io_control_no_buffer(handle, control_code: int, prefix: str) -> None:
+    from ctypes import wintypes
+
     bytes_returned = wintypes.DWORD(0)
     ok = _DeviceIoControl(
         handle,
@@ -171,6 +184,8 @@ def _device_io_control_no_buffer(handle, control_code: int, prefix: str) -> None
 def _write_chunk_to_windows_handle(handle, chunk: bytes) -> None:
     if not chunk:
         return
+
+    from ctypes import wintypes
 
     offset = 0
     total = len(chunk)
