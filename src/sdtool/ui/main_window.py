@@ -49,10 +49,17 @@ from sdtool.windows_raw import (
     get_physical_drive_size_bytes,
 )
 from sdtool.workflow import StepStatus, WorkflowController
+from sdtool.wsl_setup import (
+    build_manual_shrink_setup_help,
+    build_shrink_setup_confirmation_text,
+    get_shrink_setup_button_label,
+    launch_shrink_setup,
+)
 from sdtool.wsl_shrink import (
+    WslAvailabilityReport,
     WslCommandPlan,
     build_pishrink_plan,
-    check_wsl_pishrink_available,
+    get_shrink_availability_report,
     start_pishrink_process,
 )
 
@@ -104,6 +111,7 @@ class MainWindow(QMainWindow):
         self.current_disk_mode = "generic"
         self.has_available_disks = False
         self.shrink_ready = False
+        self.shrink_availability_report: WslAvailabilityReport | None = None
 
         self._build_ui()
         self._load_devices()
@@ -297,7 +305,7 @@ class MainWindow(QMainWindow):
 
     def _build_shrink_readiness_group(self) -> QGroupBox:
         group = QGroupBox("Shrink Readiness")
-        group.setMinimumHeight(92)
+        group.setMinimumHeight(128)
 
         layout = QGridLayout(group)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -309,9 +317,22 @@ class MainWindow(QMainWindow):
         self.shrink_readiness_value.setWordWrap(True)
         layout.addWidget(self.shrink_readiness_value, 0, 1)
 
+        layout.addWidget(QLabel("Details"), 1, 0)
+        self.shrink_readiness_detail_value = QLabel("-")
+        self.shrink_readiness_detail_value.setWordWrap(True)
+        layout.addWidget(self.shrink_readiness_detail_value, 1, 1)
+
         self.refresh_shrink_readiness_btn = QPushButton("Re-check Shrink Readiness")
         self.refresh_shrink_readiness_btn.clicked.connect(self._refresh_shrink_readiness)
-        layout.addWidget(self.refresh_shrink_readiness_btn, 1, 0, 1, 2)
+        layout.addWidget(self.refresh_shrink_readiness_btn, 2, 0)
+
+        self.install_shrink_setup_btn = QPushButton("Install / Repair Shrink Support")
+        self.install_shrink_setup_btn.clicked.connect(self._install_or_repair_shrink_support)
+        layout.addWidget(self.install_shrink_setup_btn, 2, 1)
+
+        self.show_shrink_help_btn = QPushButton("Show Setup Help")
+        self.show_shrink_help_btn.clicked.connect(self._show_shrink_setup_help)
+        layout.addWidget(self.show_shrink_help_btn, 3, 0, 1, 2)
 
         layout.setColumnStretch(1, 1)
         return group
@@ -551,17 +572,65 @@ class MainWindow(QMainWindow):
         self.result_output_path_value.setText(output_path)
 
     def _refresh_shrink_readiness(self, *, log_result: bool = True) -> None:
-        self.shrink_ready = check_wsl_pishrink_available()
-
-        if self.shrink_ready:
-            self.shrink_readiness_value.setText("Ready")
-        else:
-            self.shrink_readiness_value.setText("Not ready")
+        self.shrink_availability_report = get_shrink_availability_report()
+        self.shrink_ready = self.shrink_availability_report.is_ready
+        self.shrink_readiness_value.setText(self.shrink_availability_report.summary)
+        self.shrink_readiness_detail_value.setText(self.shrink_availability_report.detail)
+        self.install_shrink_setup_btn.setText(get_shrink_setup_button_label(self.shrink_availability_report))
 
         if log_result:
-            self._log(f"Shrink readiness checked: {'ready' if self.shrink_ready else 'not ready'}")
+            self._log(
+                f"Shrink readiness checked: {self.shrink_availability_report.code} - "
+                f"{self.shrink_availability_report.summary}"
+            )
 
         self._refresh_action_button_states()
+
+    def _install_or_repair_shrink_support(self) -> None:
+        report = self.shrink_availability_report or get_shrink_availability_report()
+        self.shrink_availability_report = report
+        self.shrink_ready = report.is_ready
+        self.shrink_readiness_value.setText(report.summary)
+        self.shrink_readiness_detail_value.setText(report.detail)
+        self.install_shrink_setup_btn.setText(get_shrink_setup_button_label(report))
+
+        reply = QMessageBox.question(
+            self,
+            "Install or repair shrink support",
+            build_shrink_setup_confirmation_text(report),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("Shrink setup launch cancelled at confirmation dialog.")
+            return
+
+        launched, detail = launch_shrink_setup(report=report)
+        if not launched:
+            QMessageBox.critical(
+                self,
+                "Could not start shrink setup",
+                f"The app could not start the shrink setup helper.\n\n{detail}",
+            )
+            self._log(f"Shrink setup helper launch failed: {detail}")
+            return
+
+        self._set_status(f"{report.summary} helper started.")
+        self._log(f"Started shrink setup helper: {detail}")
+
+    def _show_shrink_setup_help(self) -> None:
+        report = self.shrink_availability_report or get_shrink_availability_report()
+        self.shrink_availability_report = report
+        self.shrink_ready = report.is_ready
+        self.shrink_readiness_value.setText(report.summary)
+        self.shrink_readiness_detail_value.setText(report.detail)
+
+        help_text = build_manual_shrink_setup_help(report=report)
+        QMessageBox.information(
+            self,
+            "Shrink setup help",
+            help_text,
+        )
 
     def _normalized_device_label(self, label: str) -> str:
         return label.replace(" - Source", "").replace(" - Target", "")
@@ -1286,11 +1355,20 @@ class MainWindow(QMainWindow):
             self._log(f"Completed real save operation: {output_path}")
             self._record_recent_job("Completed", "save")
 
-            if check_wsl_pishrink_available():
+            readiness_report = get_shrink_availability_report()
+            self.shrink_availability_report = readiness_report
+            self.shrink_ready = readiness_report.is_ready
+            self.shrink_readiness_value.setText(readiness_report.summary)
+            self.shrink_readiness_detail_value.setText(readiness_report.detail)
+
+            if readiness_report.is_ready:
                 auto_shrink_output_path = output_path
                 self._log(f"PiShrink is available. Auto-starting shrink for saved image: {output_path}")
             else:
-                self._log("PiShrink not available. Skipping automatic shrink after save.")
+                self._log(
+                    f"Image saved. Automatic shrink is unavailable: {readiness_report.summary}. {readiness_report.detail}"
+                )
+                self._set_status("Image saved. Shrink is unavailable on this machine right now.")
         except CopyCancelledError:
             if output_path.exists():
                 try:
@@ -1552,12 +1630,14 @@ class MainWindow(QMainWindow):
             return
 
         if not self.shrink_ready:
+            report = self.shrink_availability_report or get_shrink_availability_report()
+            self.shrink_availability_report = report
             QMessageBox.critical(
                 self,
                 "PiShrink not available",
-                "Shrink is not ready. Use the Shrink Readiness section to re-check whether WSL and PiShrink are installed.",
+                f"Shrink is not ready.\n\nStatus: {report.summary}\n\nDetails: {report.detail}\n\n{report.help_text}",
             )
-            self._log("Shrink blocked because WSL PiShrink was not available.")
+            self._log(f"Shrink blocked because WSL PiShrink was not available: {report.summary}")
             return
 
         try:

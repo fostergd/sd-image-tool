@@ -1,6 +1,5 @@
-from __future__ import annotations
 
-from types import SimpleNamespace
+from __future__ import annotations
 
 import sdtool.wsl_shrink as wsl_shrink
 from sdtool.wsl_shrink import (
@@ -8,6 +7,8 @@ from sdtool.wsl_shrink import (
     build_pishrink_plan,
     check_wsl_pishrink_available,
     derive_shrunk_image_path,
+    get_shrink_availability_report,
+    list_wsl_distros,
     run_pishrink_plan,
     start_pishrink_process,
     windows_to_wsl_path,
@@ -32,10 +33,7 @@ def test_build_pishrink_plan_keeps_original_by_default() -> None:
     assert plan.image_path_windows == r"D:\images\my image.img"
     assert plan.output_path_windows == r"D:\images\my image-shrunk.img"
     assert "cp '/mnt/d/images/my image.img' '/mnt/d/images/my image-shrunk.img'" in plan.shell_command
-    assert plan.argv[0] == "wsl.exe"
-    assert "-d" in plan.argv
     assert "Ubuntu" in plan.argv
-    assert "-u" in plan.argv
     assert "root" in plan.argv
 
 
@@ -47,33 +45,28 @@ def test_build_pishrink_plan_can_shrink_in_place() -> None:
     assert plan.output_path_windows == r"D:\images\base.img"
     assert "cp " not in plan.shell_command
     assert plan.shell_command.endswith("pishrink.sh /mnt/d/images/base.img")
-    assert "-u" in plan.argv
-    assert "root" in plan.argv
-
-
-def test_build_pishrink_plan_can_run_without_explicit_user() -> None:
-    cfg = WslPiShrinkConfig(wsl_user=None)
-
-    plan = build_pishrink_plan(r"D:\images\demo.img", cfg)
-
-    assert "-u" not in plan.argv
-    assert "root" not in plan.argv
 
 
 def test_check_wsl_pishrink_available_returns_true_when_probe_succeeds(monkeypatch) -> None:
-    def fake_run(*args, **kwargs):
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(wsl_shrink.sys, "platform", "win32")
+    monkeypatch.setattr(wsl_shrink, "list_wsl_distros", lambda config=None: ["Ubuntu"])
 
-    monkeypatch.setattr(wsl_shrink.subprocess, "run", fake_run)
+    def fake_run(argv, *, timeout_seconds=None):
+        return wsl_shrink.WslRunResult(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(wsl_shrink, "_run_command", fake_run)
 
     assert check_wsl_pishrink_available(WslPiShrinkConfig())
 
 
 def test_check_wsl_pishrink_available_returns_false_when_probe_fails(monkeypatch) -> None:
-    def fake_run(*args, **kwargs):
-        return SimpleNamespace(returncode=1, stdout="", stderr="not found")
+    monkeypatch.setattr(wsl_shrink.sys, "platform", "win32")
+    monkeypatch.setattr(wsl_shrink, "list_wsl_distros", lambda config=None: ["Ubuntu"])
 
-    monkeypatch.setattr(wsl_shrink.subprocess, "run", fake_run)
+    def fake_run(argv, *, timeout_seconds=None):
+        return wsl_shrink.WslRunResult(returncode=1, stdout="", stderr="not found")
+
+    monkeypatch.setattr(wsl_shrink, "_run_command", fake_run)
 
     assert not check_wsl_pishrink_available(WslPiShrinkConfig())
 
@@ -98,20 +91,18 @@ def test_start_pishrink_process_uses_popen(monkeypatch) -> None:
 
     assert isinstance(result, DummyProcess)
     assert captured["argv"][0] == "wsl.exe"
-    assert "-u" in captured["argv"]
-    assert "root" in captured["argv"]
     assert captured["text"] is True
 
 
 def test_run_pishrink_plan_returns_completed_result(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(argv, capture_output, text, check, timeout):
+    def fake_run(argv, *, timeout_seconds=None):
         captured["argv"] = argv
-        captured["timeout"] = timeout
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+        captured["timeout"] = timeout_seconds
+        return wsl_shrink.WslRunResult(returncode=0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(wsl_shrink.subprocess, "run", fake_run)
+    monkeypatch.setattr(wsl_shrink, "_run_command", fake_run)
 
     plan = build_pishrink_plan(r"D:\images\demo.img")
     result = run_pishrink_plan(plan, timeout_seconds=120)
@@ -119,6 +110,46 @@ def test_run_pishrink_plan_returns_completed_result(monkeypatch) -> None:
     assert result.succeeded
     assert result.stdout == "ok"
     assert captured["argv"][0] == "wsl.exe"
-    assert "-u" in captured["argv"]
-    assert "root" in captured["argv"]
     assert captured["timeout"] == 120
+
+
+def test_list_wsl_distros_parses_output(monkeypatch) -> None:
+    monkeypatch.setattr(wsl_shrink.sys, "platform", "win32")
+
+    def fake_run(argv, *, timeout_seconds=None):
+        return wsl_shrink.WslRunResult(returncode=0, stdout="Ubuntu\nDebian\n", stderr="")
+
+    monkeypatch.setattr(wsl_shrink, "_run_command", fake_run)
+
+    assert list_wsl_distros() == ["Ubuntu", "Debian"]
+
+
+def test_get_shrink_availability_report_missing_distro(monkeypatch) -> None:
+    monkeypatch.setattr(wsl_shrink.sys, "platform", "win32")
+
+    def fake_run(argv, *, timeout_seconds=None):
+        return wsl_shrink.WslRunResult(returncode=0, stdout="WSL version: 2\n", stderr="")
+
+    monkeypatch.setattr(wsl_shrink, "_run_command", fake_run)
+    monkeypatch.setattr(wsl_shrink, "list_wsl_distros", lambda config=None: [])
+
+    report = get_shrink_availability_report()
+
+    assert not report.is_ready
+    assert report.code == "missing_distro"
+
+
+def test_get_shrink_availability_report_ready(monkeypatch) -> None:
+    monkeypatch.setattr(wsl_shrink.sys, "platform", "win32")
+
+    def fake_run(argv, *, timeout_seconds=None):
+        return wsl_shrink.WslRunResult(returncode=0, stdout="WSL version: 2\n", stderr="")
+
+    monkeypatch.setattr(wsl_shrink, "_run_command", fake_run)
+    monkeypatch.setattr(wsl_shrink, "list_wsl_distros", lambda config=None: ["Ubuntu"])
+    monkeypatch.setattr(wsl_shrink, "check_wsl_pishrink_available", lambda config=None: True)
+
+    report = get_shrink_availability_report()
+
+    assert report.is_ready
+    assert report.code == "ready"

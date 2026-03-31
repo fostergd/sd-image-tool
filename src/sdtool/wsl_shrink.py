@@ -1,7 +1,10 @@
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+import locale
+import os
 import shlex
 import subprocess
 import sys
@@ -47,6 +50,75 @@ class WslRunResult:
         return self.returncode == 0
 
 
+@dataclass(frozen=True, slots=True)
+class WslAvailabilityReport:
+    is_ready: bool
+    code: str
+    summary: str
+    detail: str
+    help_text: str
+    simulation: str | None = None
+    distro_name: str | None = None
+
+
+_SIM_ENV_NAME = "SDTOOL_SHRINK_SIMULATE_STATE"
+
+
+def _clean_decoded_text(text: str) -> str:
+    text = text.replace("\x00", "").replace("\ufeff", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32)
+
+
+def _decode_subprocess_stream(data: bytes | str | None) -> str:
+    if data is None:
+        return ""
+
+    if isinstance(data, str):
+        return _clean_decoded_text(data)
+
+    if not data:
+        return ""
+
+    candidates: list[str] = []
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in data:
+        candidates.extend(["utf-16", "utf-16le", "utf-16be"])
+
+    preferred = locale.getpreferredencoding(False) or "utf-8"
+    candidates.extend(["utf-8-sig", "utf-8", preferred, "cp1252"])
+
+    seen: set[str] = set()
+    for encoding in candidates:
+        if encoding in seen:
+            continue
+        seen.add(encoding)
+        try:
+            return _clean_decoded_text(data.decode(encoding))
+        except UnicodeDecodeError:
+            continue
+
+    return _clean_decoded_text(data.decode(preferred, errors="replace"))
+
+
+def _run_command(
+    argv: list[str],
+    *,
+    timeout_seconds: int | float | None = None,
+) -> WslRunResult:
+    result = subprocess.run(
+        argv,
+        capture_output=True,
+        text=False,
+        check=False,
+        timeout=timeout_seconds,
+    )
+    return WslRunResult(
+        returncode=result.returncode,
+        stdout=_decode_subprocess_stream(result.stdout),
+        stderr=_decode_subprocess_stream(result.stderr),
+    )
+
+
 def windows_to_wsl_path(path: str) -> str:
     text = str(path).strip().replace("/", "\\")
     if len(text) < 3 or text[1] != ":":
@@ -78,6 +150,82 @@ def _build_wsl_argv(shell_command: str, config: WslPiShrinkConfig) -> list[str]:
 
     argv.extend([config.shell_executable, config.shell_login_flag, shell_command])
     return argv
+
+
+def _default_distro_name(config: WslPiShrinkConfig | None = None) -> str:
+    cfg = config or WslPiShrinkConfig()
+    return cfg.distro or "Ubuntu"
+
+
+def _select_distro_name(
+    config: WslPiShrinkConfig | None = None,
+    distros: list[str] | None = None,
+) -> str:
+    cfg = config or WslPiShrinkConfig()
+    if cfg.distro:
+        return cfg.distro
+    if distros:
+        return distros[0]
+    return "Ubuntu"
+
+
+def _detect_simulation_override(simulate_state: str | None = None) -> str | None:
+    state = (simulate_state or os.getenv(_SIM_ENV_NAME, "")).strip().lower()
+    return state or None
+
+
+def _build_simulated_report(state: str) -> WslAvailabilityReport:
+    if state == "ready":
+        return WslAvailabilityReport(
+            is_ready=True,
+            code="ready",
+            summary="Ready (simulated)",
+            detail="Shrink readiness is being simulated as ready on this machine.",
+            help_text=(
+                "Simulation mode is active. Remove the environment variable "
+                f"{_SIM_ENV_NAME} to return to real WSL/PiShrink detection."
+            ),
+            simulation=state,
+        )
+
+    summary_map = {
+        "missing_wsl": "Step 1 of 3: Install WSL",
+        "missing_distro": "Step 2 of 3: Install Linux distro",
+        "missing_pishrink": "Step 3 of 3: Install PiShrink",
+    }
+    detail_map = {
+        "missing_wsl": "Shrink readiness is being simulated as missing WSL on this machine.",
+        "missing_distro": "Shrink readiness is being simulated as missing a Linux distribution.",
+        "missing_pishrink": "Shrink readiness is being simulated as missing pishrink.sh.",
+    }
+    if state in summary_map:
+        return WslAvailabilityReport(
+            is_ready=False,
+            code=state,
+            summary=summary_map[state],
+            detail=detail_map[state],
+            help_text=(
+                "Simulation mode is active. Remove the environment variable "
+                f"{_SIM_ENV_NAME} to return to real WSL/PiShrink detection."
+            ),
+            simulation=state,
+            distro_name="Ubuntu",
+        )
+
+    return WslAvailabilityReport(
+        is_ready=False,
+        code="invalid_simulation",
+        summary="Unknown shrink simulation state",
+        detail=(
+            f"Unsupported value '{state}' for {_SIM_ENV_NAME}. "
+            "Use ready, missing_wsl, missing_distro, or missing_pishrink."
+        ),
+        help_text=(
+            "Remove the simulation environment variable or set it to one of: "
+            "ready, missing_wsl, missing_distro, missing_pishrink."
+        ),
+        simulation=state,
+    )
 
 
 def build_pishrink_plan(
@@ -155,7 +303,7 @@ def build_fsck_preflight_plan(
         "  exit 21",
         "fi",
         'echo "[sdtool] scanning ext filesystem partitions"',
-        'PARTS="$(lsblk -lnpo NAME,FSTYPE "$LOOPDEV" | awk \'$2 ~ /^ext[234]$/ {print $1}\')"',
+        'PARTS="$(lsblk -lnpo NAME,FSTYPE "$LOOPDEV" | grep -E " ext[234]$" | cut -d" " -f1)"',
         'if [ -z "$PARTS" ]; then',
         '  echo "[sdtool] no ext filesystem partitions found in image"',
         "  exit 20",
@@ -198,18 +346,7 @@ def run_pishrink_plan(
     plan: WslCommandPlan,
     timeout_seconds: int | float | None = None,
 ) -> WslRunResult:
-    result = subprocess.run(
-        plan.argv,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
-    )
-    return WslRunResult(
-        returncode=result.returncode,
-        stdout=result.stdout,
-        stderr=result.stderr,
-    )
+    return _run_command(plan.argv, timeout_seconds=timeout_seconds)
 
 
 def run_fsck_preflight(
@@ -217,24 +354,31 @@ def run_fsck_preflight(
     timeout_seconds: int | float | None = None,
 ) -> WslRunResult:
     try:
-        result = subprocess.run(
-            plan.argv,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
-        return WslRunResult(
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
+        return _run_command(plan.argv, timeout_seconds=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
         return WslRunResult(
             returncode=124,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or f"Preflight timed out after {timeout_seconds} seconds.",
+            stdout=_decode_subprocess_stream(exc.stdout),
+            stderr=_decode_subprocess_stream(exc.stderr) or f"Preflight timed out after {timeout_seconds} seconds.",
         )
+
+
+def list_wsl_distros(config: WslPiShrinkConfig | None = None) -> list[str]:
+    if sys.platform != "win32":
+        return []
+
+    cfg = config or WslPiShrinkConfig()
+    result = _run_command([cfg.wsl_executable, "--list", "--quiet"])
+
+    if result.returncode != 0:
+        return []
+
+    distros: list[str] = []
+    for line in result.stdout.splitlines():
+        name = line.strip().replace("\x00", "")
+        if name and name not in distros:
+            distros.append(name)
+    return distros
 
 
 def check_wsl_pishrink_available(config: WslPiShrinkConfig | None = None) -> bool:
@@ -242,20 +386,155 @@ def check_wsl_pishrink_available(config: WslPiShrinkConfig | None = None) -> boo
         return False
 
     cfg = config or WslPiShrinkConfig()
-    probe_command = f"command -v {shlex.quote(cfg.pishrink_command)} >/dev/null 2>&1"
-    argv = _build_wsl_argv(probe_command, cfg)
+    selected_distro = _select_distro_name(cfg, list_wsl_distros(cfg))
+    probe_cfg = replace(cfg, distro=selected_distro) if selected_distro else cfg
+    probe_command = f"command -v {shlex.quote(probe_cfg.pishrink_command)} >/dev/null 2>&1"
+    result = _run_command(_build_wsl_argv(probe_command, probe_cfg))
+    return result.returncode == 0
+
+
+def _normalize_wsl_probe_text(*parts: str) -> str:
+    return _clean_decoded_text("\n".join(part for part in parts if part)).strip()
+
+
+def _probe_indicates_missing_wsl(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "optional component" in lowered
+        or "wsl_e_wsl_optional_component_required" in lowered
+        or "requires the windows subsystem for linux optional component" in lowered
+        or "wsl was not found" in lowered
+        or "is not recognized as the name of a cmdlet" in lowered
+        or "windows subsystem for linux has not been enabled" in lowered
+    )
+
+
+def _probe_indicates_missing_distro(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "no installed distributions" in lowered
+        or "windows subsystem for linux has no installed distributions" in lowered
+    )
+
+
+def get_shrink_availability_report(
+    config: WslPiShrinkConfig | None = None,
+    *,
+    simulate_state: str | None = None,
+) -> WslAvailabilityReport:
+    simulation = _detect_simulation_override(simulate_state)
+    if simulation is not None:
+        return _build_simulated_report(simulation)
+
+    cfg = config or WslPiShrinkConfig()
+    preferred_distro = _default_distro_name(cfg)
+
+    if sys.platform != "win32":
+        return WslAvailabilityReport(
+            is_ready=False,
+            code="non_windows",
+            summary="Shrink is only available on Windows with WSL.",
+            detail="The current platform is not Windows, so WSL-based PiShrink is unavailable.",
+            help_text="Use the Windows build of the app on a system with WSL installed to enable shrink.",
+        )
 
     try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            check=False,
+        probe = _run_command([cfg.wsl_executable, "--status"])
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return WslAvailabilityReport(
+            is_ready=False,
+            code="missing_wsl",
+            summary="Step 1 of 3: Install WSL",
+            detail="The app could not run wsl.exe on this machine.",
+            help_text=(
+                "Use the app's Install / Repair button to install WSL with minimal steps, or install it manually with "
+                "'wsl --install --no-distribution'. A restart may be required."
+            ),
+            distro_name=preferred_distro,
         )
-    except (FileNotFoundError, OSError):
-        return False
 
-    return result.returncode == 0
+    probe_text = _normalize_wsl_probe_text(probe.stdout, probe.stderr)
+
+    if probe.returncode != 0:
+        if _probe_indicates_missing_wsl(probe_text):
+            return WslAvailabilityReport(
+                is_ready=False,
+                code="missing_wsl",
+                summary="Step 1 of 3: Install WSL",
+                detail=probe_text or "The Windows Subsystem for Linux optional component is not enabled on this machine.",
+                help_text=(
+                    "Use the app's Install / Repair button to install or repair WSL, or install it manually with "
+                    "'wsl --install --no-distribution'. A restart may be required."
+                ),
+                distro_name=preferred_distro,
+            )
+
+        if _probe_indicates_missing_distro(probe_text):
+            return WslAvailabilityReport(
+                is_ready=False,
+                code="missing_distro",
+                summary="Step 2 of 3: Install Linux distro",
+                detail=f"WSL is installed, but no Linux distribution is ready. Install {preferred_distro}, launch it once, then return here for PiShrink installation.",
+                help_text=(
+                    f"Use the app's Install / Repair button to install {preferred_distro}, or run "
+                    f"'wsl --install -d {preferred_distro}' manually. Launch the distro once after install "
+                    "to finish first-run setup."
+                ),
+                distro_name=preferred_distro,
+            )
+
+        return WslAvailabilityReport(
+            is_ready=False,
+            code="missing_wsl",
+            summary="Step 1 of 3: Install WSL",
+            detail=probe_text or "wsl.exe reported an error while checking availability.",
+            help_text=(
+                "Use the app's Install / Repair button to install or repair WSL, or install it manually with "
+                "'wsl --install --no-distribution'. A restart may be required."
+            ),
+            distro_name=preferred_distro,
+        )
+
+    distros = list_wsl_distros(cfg)
+    selected_distro = _select_distro_name(cfg, distros)
+
+    if not distros:
+        return WslAvailabilityReport(
+            is_ready=False,
+            code="missing_distro",
+            summary="Step 2 of 3: Install Linux distro",
+            detail=f"WSL is installed, but no Linux distribution is ready. Install {selected_distro}, launch it once, then return here for PiShrink installation.",
+            help_text=(
+                f"Use the app's Install / Repair button to install {selected_distro}, or run "
+                f"'wsl --install -d {selected_distro}' manually. Launch the distro once after install "
+                "to finish first-run setup."
+            ),
+            distro_name=selected_distro,
+        )
+
+    if not check_wsl_pishrink_available(replace(cfg, distro=selected_distro)):
+        return WslAvailabilityReport(
+            is_ready=False,
+            code="missing_pishrink",
+            summary="Step 3 of 3: Install PiShrink",
+            detail=f"WSL and the distro '{selected_distro}' are ready, but {cfg.pishrink_command} is not installed yet.",
+            help_text=(
+                "Use the app's Install / Repair button to install pishrink.sh into WSL, or install it manually inside your distro."
+            ),
+            distro_name=selected_distro,
+        )
+
+    return WslAvailabilityReport(
+        is_ready=True,
+        code="ready",
+        summary="Ready",
+        detail=f"WSL and PiShrink are available in the WSL distro '{selected_distro}'.",
+        help_text=(
+            f"To simulate a missing component on this same machine for testing, set {_SIM_ENV_NAME} to one of: "
+            "missing_wsl, missing_distro, missing_pishrink, ready."
+        ),
+        distro_name=selected_distro,
+    )
 
 
 def start_pishrink_process(
