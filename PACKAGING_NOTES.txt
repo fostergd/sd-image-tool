@@ -1,0 +1,8 @@
+Bundle contents:
+- src/sdtool/windows_elevation.py
+- src/sdtool/app.py
+- scripts/run_app.ps1
+- scripts/build_windows_release.ps1
+- packaging/windows/sd-image-tool.manifest
+- packaging/windows/sd-image-tool.spec
+- tests/test_windows_elevation.py

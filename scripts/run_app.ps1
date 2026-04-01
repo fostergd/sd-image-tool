@@ -1,4 +1,12 @@
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
 
-Set-Location (Join-Path $PSScriptRoot "..")
-& .\.venv\Scripts\python.exe -m sdtool.app
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$venvPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
+
+if (Test-Path $venvPython) {
+    & $venvPython -m sdtool.app
+    exit $LASTEXITCODE
+}
+
+py -3.12 -m sdtool.app
+exit $LASTEXITCODE
