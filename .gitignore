@@ -4,9 +4,15 @@ __pycache__/
 .pytest_cache/
 dist/
 build/
-*.spec
+src/*.egg-info/
 *.egg-info/
 .aider*
+.coverage
+htmlcov/
+*.log
+
+# Keep packaged release zips out of git
+releases/
 
 # App-generated image files and local vault contents
 vault-images/
