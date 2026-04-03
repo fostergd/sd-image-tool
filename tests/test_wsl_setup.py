@@ -45,29 +45,29 @@ def test_build_shrink_setup_script_stage3_mentions_required_packages_and_repo_he
     script = build_shrink_setup_script(report=_report("missing_pishrink"))
     assert '$Distro = "Kali"' in script
     assert 'apt-get install -y curl parted e2fsprogs util-linux coreutils ca-certificates' in script
-    assert 'If apt reports repository or GPG errors' in script
-    assert 'The password will not be shown while you type.' in script
+    assert "If apt reports repository or GPG errors" in script
+    assert "The password will not be shown while you type." in script
 
 
 def test_manual_help_and_confirmation_use_actual_distro_and_explain_next_steps() -> None:
     help_text = build_manual_shrink_setup_help(report=_report("missing_pishrink"))
     confirmation = build_shrink_setup_confirmation_text(_report("missing_pishrink"))
-    assert 'Open the Kali WSL distro' in help_text
-    assert 'If apt-get update fails with repository or GPG errors' in help_text
-    assert 'inside the WSL distro Kali' in confirmation
-    assert 'What happens next:' in confirmation
-    assert 'fix that distro's package sources and then run Step 3 again' in confirmation
+    assert "Open the Kali WSL distro" in help_text
+    assert "If apt-get update fails with repository or GPG errors" in help_text
+    assert "inside the WSL distro Kali" in confirmation
+    assert "What happens next:" in confirmation
+    assert "fix that distro's package sources and then run Step 3 again" in confirmation
 
 
 def test_stage1_confirmation_and_help_always_tell_user_to_reboot() -> None:
     confirmation = build_shrink_setup_confirmation_text(_report("missing_wsl"))
     help_text = build_manual_shrink_setup_help(report=_report("missing_wsl"))
-    assert 'Reboot Windows after this step before continuing' in confirmation
-    assert 'even if Windows does not explicitly ask' in confirmation
-    assert 'Restart Windows after Step 1, even if Windows does not explicitly prompt for it.' in help_text
+    assert "Reboot Windows after this step before continuing" in confirmation
+    assert "even if Windows does not explicitly ask" in confirmation
+    assert "Restart Windows after Step 1, even if Windows does not explicitly prompt for it." in help_text
 
 
 def test_stage2_confirmation_explains_manual_close_if_prompt_remains() -> None:
     confirmation = build_shrink_setup_confirmation_text(_report("missing_distro"))
-    assert 'If the distro window stays open at a prompt afterward' in confirmation
-    assert 'type exit or close that window manually' in confirmation
+    assert "type exit if the Linux shell stays open" in confirmation
+    assert "continue with Step 3" in confirmation
