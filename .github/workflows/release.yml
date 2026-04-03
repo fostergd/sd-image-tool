@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Create virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e .
+          .\.venv\Scripts\python.exe -m pip install pytest pyinstaller
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          .\scripts\run_tests.ps1
+
+      - name: Build release zip
+        shell: pwsh
+        run: |
+          .\scripts\build_windows_release.ps1
+
+      - name: Find release zip
+        id: find_zip
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem .\releases\*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $zip) {
+            throw "No release zip was created under releases\"
+          }
+          "zip_path=$($zip.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Find release notes
+        id: find_notes
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $notes = Join-Path $PWD "docs/releases/$tag-release-notes.md"
+          if (Test-Path $notes) {
+            "notes_path=$notes" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-windows-x64
+          path: ${{ steps.find_zip.outputs.zip_path }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release with notes file
+        if: steps.find_notes.outputs.notes_path != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find_zip.outputs.zip_path }}
+          body_path: ${{ steps.find_notes.outputs.notes_path }}
+          fail_on_unmatched_files: true
+
+      - name: Publish GitHub release with generated notes
+        if: steps.find_notes.outputs.notes_path == ''
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.find_zip.outputs.zip_path }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

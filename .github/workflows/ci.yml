@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test-windows:
+    name: Test on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Create virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e .
+          .\.venv\Scripts\python.exe -m pip install pytest pyinstaller
+
+      - name: Run test suite
+        shell: pwsh
+        run: |
+          .\scripts\run_tests.ps1
+
+  package-smoke:
+    name: Package smoke test
+    runs-on: windows-latest
+    needs: test-windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Create virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e .
+          .\.venv\Scripts\python.exe -m pip install pytest pyinstaller
+
+      - name: Build packaged app
+        shell: pwsh
+        run: |
+          .\scripts\build_windows_release.ps1
+
+      - name: Upload smoke-build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-smoke-build
+          path: releases/*.zip
+          if-no-files-found: error
