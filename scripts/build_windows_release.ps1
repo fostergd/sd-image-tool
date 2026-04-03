@@ -1,31 +1,52 @@
-$ErrorActionPreference = 'Stop'
+\
+param(
+    [string]$Version = "0.1.1"
+)
+
+$ErrorActionPreference = "Stop"
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoRoot = Split-Path -Parent $scriptRoot
-$venvPython = Join-Path $repoRoot '.venv\Scripts\python.exe'
-$specFile = Join-Path $repoRoot 'packaging\windows\sd-image-tool.spec'
+$projectRoot = Resolve-Path (Join-Path $scriptRoot "..")
+Set-Location $projectRoot
 
+$venvPython = Join-Path $projectRoot ".venv\Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
-    throw "Virtual environment Python was not found at $venvPython"
+    throw "Virtual environment not found at .venv. Activate or create the project venv first."
 }
 
 & $venvPython -m pip install pyinstaller
 if ($LASTEXITCODE -ne 0) {
-    throw 'Could not install or update PyInstaller.'
+    throw "PyInstaller install/update failed."
 }
 
-Push-Location $repoRoot
-try {
-    & $venvPython -m PyInstaller --noconfirm --clean $specFile
-    if ($LASTEXITCODE -ne 0) {
-        throw 'PyInstaller build failed.'
-    }
+$distDir = Join-Path $projectRoot "dist"
+$buildDir = Join-Path $projectRoot "build"
+$releaseDir = Join-Path $projectRoot "releases"
 
-    Write-Host ''
-    Write-Host 'Build completed successfully.' -ForegroundColor Green
-    Write-Host 'Executable folder:' -ForegroundColor Green
-    Write-Host (Join-Path $repoRoot 'dist\SD Image Tool')
+if (Test-Path $distDir) { Remove-Item $distDir -Recurse -Force }
+if (Test-Path $buildDir) { Remove-Item $buildDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+
+$env:SDTOOL_VERSION = $Version
+
+$specPath = Join-Path $projectRoot "packaging\windows\sd-image-tool.spec"
+& $venvPython -m PyInstaller --clean $specPath
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller build failed."
 }
-finally {
-    Pop-Location
+
+$appFolder = Join-Path $distDir "SD Image Tool"
+if (-not (Test-Path $appFolder)) {
+    throw "Expected packaged app folder was not created: $appFolder"
 }
+
+$zipName = "SD-Image-Tool-v{0}-windows-x64.zip" -f $Version
+$zipPath = Join-Path $releaseDir $zipName
+if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+
+Compress-Archive -Path (Join-Path $appFolder "*") -DestinationPath $zipPath -CompressionLevel Optimal
+
+Write-Host ""
+Write-Host "Build complete." -ForegroundColor Green
+Write-Host "App folder: $appFolder"
+Write-Host "Release zip: $zipPath"

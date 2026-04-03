@@ -71,6 +71,8 @@ def test_get_shrink_availability_report_marks_missing_tools(monkeypatch) -> None
     report = get_shrink_availability_report(WslPiShrinkConfig())
     assert not report.is_ready
     assert report.code == "missing_pishrink"
+    assert report.summary == "Step 3 of 3: Install PiShrink and tools"
+    assert "Start Step 3" in report.detail
     assert "parted" in report.detail
     assert report.distro_name == "kali-linux"
 

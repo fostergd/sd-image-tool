@@ -121,7 +121,7 @@ def _build_simulated_report(state: str) -> WslAvailabilityReport:
             is_ready=True,
             code="ready",
             summary="Ready (simulated)",
-            detail="Shrink readiness is being simulated as ready on this machine.",
+            detail="Simulated ready state. Shrink support is being treated as fully available on this machine.",
             help_text=f"Remove {_SIM_ENV_NAME} to return to real WSL/PiShrink detection.",
             simulation=state,
             distro_name="Ubuntu",
@@ -131,7 +131,7 @@ def _build_simulated_report(state: str) -> WslAvailabilityReport:
             is_ready=False,
             code="missing_wsl",
             summary="Step 1 of 3: Install WSL",
-            detail="Shrink readiness is being simulated as missing WSL on this machine.",
+            detail="Simulated missing-WSL state. Use Step 1 to install the Windows Subsystem for Linux feature, reboot if Windows asks, then re-check readiness.",
             help_text=f"Remove {_SIM_ENV_NAME} to return to real WSL/PiShrink detection.",
             simulation=state,
             distro_name="Ubuntu",
@@ -141,7 +141,7 @@ def _build_simulated_report(state: str) -> WslAvailabilityReport:
             is_ready=False,
             code="missing_distro",
             summary="Step 2 of 3: Install Linux distro",
-            detail="Shrink readiness is being simulated as missing a Linux distribution.",
+            detail="Simulated missing-distro state. Use Step 2 to install a Linux distro, launch it once to create the Linux user, then re-check readiness.",
             help_text=f"Remove {_SIM_ENV_NAME} to return to real WSL/PiShrink detection.",
             simulation=state,
             distro_name="Ubuntu",
@@ -150,8 +150,8 @@ def _build_simulated_report(state: str) -> WslAvailabilityReport:
         return WslAvailabilityReport(
             is_ready=False,
             code="missing_pishrink",
-            summary="Step 3 of 3: Install PiShrink",
-            detail="Shrink readiness is being simulated as missing PiShrink or required tools.",
+            summary="Step 3 of 3: Install PiShrink and tools",
+            detail="Simulated missing-PiShrink state. Use Step 3 to install PiShrink and the required Linux tools, then re-check readiness.",
             help_text=f"Remove {_SIM_ENV_NAME} to return to real WSL/PiShrink detection.",
             simulation=state,
             distro_name="Ubuntu",
@@ -364,8 +364,8 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
             is_ready=False,
             code="non_windows",
             summary="Shrink is only available on Windows with WSL.",
-            detail="The current platform is not Windows, so WSL-based PiShrink is unavailable.",
-            help_text="Use the Windows build of the app on a system with WSL installed to enable shrink.",
+            detail="This machine is not running Windows, so WSL-based PiShrink cannot be used here.",
+            help_text="Use the Windows build of the app on a Windows system with WSL installed to enable shrink.",
             distro_name=default_distro,
         )
 
@@ -376,7 +376,7 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
             is_ready=False,
             code="missing_wsl",
             summary="Step 1 of 3: Install WSL",
-            detail="The app could not run wsl.exe on this machine.",
+            detail="The app could not run wsl.exe on this machine. Start Step 1 to install the Windows Subsystem for Linux feature, then reboot if Windows asks.",
             help_text="Use the app's Install / Repair button to install WSL. A restart may be required.",
             distro_name=default_distro,
         )
@@ -388,7 +388,7 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
                 is_ready=False,
                 code="missing_wsl",
                 summary="Step 1 of 3: Install WSL",
-                detail=probe_text or "The Windows Subsystem for Linux optional component is not enabled on this machine.",
+                detail=probe_text or "The Windows Subsystem for Linux optional component is not enabled on this machine. Start Step 1, reboot if Windows asks, then re-check readiness.",
                 help_text="Use the app's Install / Repair button to install or repair WSL. A restart may be required.",
                 distro_name=default_distro,
             )
@@ -397,7 +397,7 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
                 is_ready=False,
                 code="missing_distro",
                 summary="Step 2 of 3: Install Linux distro",
-                detail=f"WSL is installed, but no Linux distribution is ready. Install {default_distro}, launch it once, then return here for PiShrink installation.",
+                detail=f"WSL is installed, but no Linux distribution is ready. Start Step 2 to install {default_distro}, launch it once to create the Linux user, then re-check readiness.",
                 help_text=f"Use the app's Install / Repair button to install {default_distro}, then launch it once for first-run setup.",
                 distro_name=default_distro,
             )
@@ -405,7 +405,7 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
             is_ready=False,
             code="missing_wsl",
             summary="Step 1 of 3: Install WSL",
-            detail=probe_text or "wsl.exe reported an error while checking availability.",
+            detail=probe_text or "wsl.exe reported an error while checking availability. Start Step 1 to repair WSL, then re-check readiness.",
             help_text="Use the app's Install / Repair button to install or repair WSL.",
             distro_name=default_distro,
         )
@@ -417,7 +417,7 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
             is_ready=False,
             code="missing_distro",
             summary="Step 2 of 3: Install Linux distro",
-            detail=f"WSL is installed, but no Linux distribution is ready. Install {distro_name}, launch it once, then return here for PiShrink installation.",
+            detail=f"WSL is installed, but no Linux distribution is ready. Start Step 2 to install {distro_name}, launch it once to create the Linux user, then re-check readiness.",
             help_text=f"Use the app's Install / Repair button to install {distro_name}, then launch it once for first-run setup.",
             distro_name=distro_name,
         )
@@ -430,9 +430,9 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
         return WslAvailabilityReport(
             is_ready=False,
             code="missing_pishrink",
-            summary="Step 3 of 3: Install PiShrink",
-            detail=f"WSL and the distro '{distro_name}' are ready, but shrink support is incomplete. Missing items: {missing_list}.",
-            help_text="Use the app's Install / Repair button to install or repair PiShrink and its required tools inside WSL.",
+            summary="Step 3 of 3: Install PiShrink and tools",
+            detail=f"WSL and the distro '{distro_name}' are ready, but shrink support is incomplete. Start Step 3 to install or repair PiShrink and the required Linux tools. Missing items: {missing_list}.",
+            help_text="Use the app's Install / Repair button to install or repair PiShrink and its required tools inside WSL. If Linux package sources are broken, fix them in the distro and then run Step 3 again.",
             distro_name=distro_name,
             missing_tools=missing_tools,
         )
@@ -441,7 +441,7 @@ def get_shrink_availability_report(config: WslPiShrinkConfig | None = None, *, s
         is_ready=True,
         code="ready",
         summary="Ready",
-        detail=f"WSL, PiShrink, and required tools are available in the WSL distro '{distro_name}'.",
+        detail=f"WSL, PiShrink, and the required Linux tools are available in the WSL distro '{distro_name}'. Shrink is ready to use.",
         help_text=f"To simulate a missing component on this same machine for testing, set {_SIM_ENV_NAME} to missing_wsl, missing_distro, missing_pishrink, or ready.",
         distro_name=distro_name,
     )

@@ -1,0 +1,33 @@
+\
+# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 1, 1, 0),
+    prodvers=(0, 1, 1, 0),
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'SD Image Tool Project'),
+            StringStruct('FileDescription', 'SD Image Tool'),
+            StringStruct('FileVersion', '0.1.1'),
+            StringStruct('InternalName', 'SD Image Tool'),
+            StringStruct('OriginalFilename', 'SD Image Tool.exe'),
+            StringStruct('ProductName', 'SD Image Tool'),
+            StringStruct('ProductVersion', '0.1.1'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
